@@ -36,8 +36,8 @@ DEFAULT_PRESSURE_ERROR_MAX = 0   # 最大压力误差
 
 # ── 日级缺口填充 (推理端专用, 不动训练共用管线 data_processing.py) ──
 # 数据跨度内每个缺失的 bin 都用"离它最近一天的同时段"原始值补齐, 见
-# FlowPredictor._fill_day_gaps。缺口无论大小一律补: 滞后特征最长 2 天, 单个缺失
-# bin 也会级联删掉其后 2 天内的行 (输入不足时会报输入长度不足)
+# FlowPredictor._fill_day_gaps。缺口无论大小一律补: 缺失 bin 会减少可用行数,
+# 严重时触发输入长度不足报错 (lookback 不足)
 
 
 class FlowPredictor:
@@ -47,15 +47,12 @@ class FlowPredictor:
     lookback_days 天的原始数据, 输出未来 predict_days 天的 30min 级
     预测流量序列。
 
-    输入 DataFrame 格式与训练数据一致 (D:\\Junshan_Project\\data\\水厂2025年小时级汇总.csv 同构):
+    输入 DataFrame 格式 (D:\\Junshan_Project\\data\\水厂2025年小时级汇总.csv 同构):
       时间列:  时间 / timestamp (整点小时级, 或直接给 DatetimeIndex 索引)
-      必需列:  出厂水流量 (m³/h), 出厂水压力 (MPa)
-      可选列:  1#/6#泵运行频率 (Hz), 1#/2#/6#送水泵运行 (0/1; 缺失时泵台数按 0)
+      必需列:  出厂水流量 (m³/h)  ← 本管线只读流量, 压力/泵量测不再读取
 
-    时间跨度: 至少 lookback_days + 2 天 (最长滞后特征为 2 天, 见下注),
-              建议提供 7 天以上, 前 2 天用于填满滞后特征。
-      注: 特征里 flow_lag_2day 需要 2 天前的值, 所以只给恰好 lookback 天的
-          数据会导致滞后特征全为 NaN 被删光, 必须多带历史。
+    时间跨度: 至少 lookback_days 天 (无滞后特征, 不需多带历史),
+              建议提供 7 天以上以保证输入窗口充足。
       缺口处理: 数据跨度内 (首尾天按完整 24h 网格) 缺失的 bin 一律用离它最近
           的一天同时段数据补齐 (见 _fill_day_gaps), 保证时间轴连续、长度校验通过;
           仍找不到的时刻保持缺失, 由后续 dropna 兜底。
@@ -128,7 +125,7 @@ class FlowPredictor:
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
 
-        # ── 复用训练的特征工程对象 (清洗/重采样/时间/滞后特征完全一致) ──
+        # ── 复用训练的清洗对象 (清洗/重采样口径完全一致; 无特征工程) ──
         self.processor = DataProcessor(self.config)
         self.processor.feature_scaler = self.feature_scaler
         self.processor.target_scaler = self.target_scaler
@@ -353,11 +350,10 @@ class FlowPredictor:
 
         重采样后的空 bin 已被 dropna 删掉 (表里没有的槽位即缺失); 跨度按完整日历天
         取网格 [首日 00:00, 末日 23:00], 跨度内每个缺失 bin 逐圈找 (d-1, d+1,
-        d-2, d+2, ...) 取第一个该时刻有原始数据的一天, 整行复制 (流量/压力/泵数)。
+        d-2, d+2, ...) 取第一个该时刻有原始数据的一天, 整行复制 (仅流量)。
 
-        为什么缺口无论大小一律补: 滞后特征最长 2 天, 单个缺失 bin 会让其后 2 天内
-        的行因滞后特征 NaN 被 dropna 级联删除——输入不足时触发输入长度报错。
-        补齐后时间轴连续, 特征计算正常。
+        为什么缺口无论大小一律补: 缺失 bin 会减少可用行数, 严重时触发输入长度
+        报错 (lookback 不足); 补齐后时间轴连续, 输入窗口充足。
 
         输入数据所有天都缺的时刻保持缺失, 由后续 dropna 与输入长度校验兜底。
         源只取原始数据 (填充结果不参与做源)。已有值一律不动。
@@ -410,28 +406,27 @@ class FlowPredictor:
         df = df.sort_index()
         print(f"[predict] 输入数据: {df.index.min()} ~ {df.index.max()}, {len(df)} 行")
 
-        # ── ① 清洗 + 特征工程 (与训练完全相同; 单段整体清洗, 无 train/test 切分) ──
+        # ── ① 清洗 (与训练完全相同; 单段整体清洗, 无 train/test 切分) ──
+        #    特征工程已删除: 模型输入仅 Total_Flow 单通道。
         df_base = self.processor.build_base_features(df)
         df_clean = self.processor.clean_and_resample(df_base)
         # 日级缺口填充: 某天缺失大量 bin 时, 用最近一天同时段数据补齐 (推理端专用)
         df_clean = self._fill_day_gaps(df_clean)
-        df_time = self.processor.add_time_features(df_clean)
-        df_feat = self.processor.add_lag_rolling_features(df_time)   # 内含 dropna
 
         # 校验特征列与训练一致 (输入格式不同会导致特征集合不同)
-        missing = [c for c in self.feature_cols if c not in df_feat.columns]
+        missing = [c for c in self.feature_cols if c not in df_clean.columns]
         if missing:
             raise ValueError(
                 f"特征列与训练不一致, 缺失: {missing[:5]}...\n"
                 f"请检查输入数据列与训练数据 (水厂2025年小时级汇总.csv) 是否同构")
-        df_feat = df_feat[self.feature_cols]
+        df_feat = df_clean[self.feature_cols]
 
         if len(df_feat) < self.lookback_steps:
             raise ValueError(
-                f"输入历史不足: 清洗+特征工程后仅剩 {len(df_feat)} 行, "
+                f"输入历史不足: 清洗后仅剩 {len(df_feat)} 行, "
                 f"模型需要 ≥ {self.lookback_steps} 行 (lookback={self.lookback_days}天)。\n"
-                f"最长滞后特征为 2 天, 建议提供 ≥ {self.lookback_days + 2} 天的原始数据。")
-        print(f"[predict] 清洗+特征工程后: {len(df_feat)} 行 ({df_feat.index.min()} ~ {df_feat.index.max()})")
+                f"特征工程已删除 (无滞后特征), 提供 ≥ lookback 天的原始数据即可。")
+        print(f"[predict] 清洗后: {len(df_feat)} 行 ({df_feat.index.min()} ~ {df_feat.index.max()})")
 
         # ── ② 取最后 lookback_steps 行作为模型输入窗口 ──
         window = df_feat.iloc[-self.lookback_steps:]

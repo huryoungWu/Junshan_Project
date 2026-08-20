@@ -34,22 +34,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 #                           整个 horizon。训练与评估都用同一套自回归 rollout。
 #
 # 自回归 rollout 细节:
-#   - 模型仅预测目标通道 (Total_Flow, output_dim=1)。输入窗口是多维特征
-#     (流量 + 压力 + 泵状态/频率 + 时间/滞后/滚动特征)。
-#   - 每一步: model(window) → 预测下一个时刻的流量 (标量) → 取"未来外生
-#     特征行"(ground-truth, 训练/评估时数据集里已有), 把其中的目标通道替换成
-#     本轮预测值 → 拼到窗口末尾, 丢掉最旧一行, 滑窗前进一步 → 预测下一时刻。
-#   - 外生通道 (压力/泵/时间/滞后特征) 用 ground-truth (teacher forcing on
-#     exogenous), 只有目标通道是模型自己的预测回灌 —— 这正是"把上一轮预测当
-#     输入"的部分; 单目标预测下外生通道无法由模型生成, 必须用真值补齐 (与
-#     原直接多步模型一样, 不预测外生通道)。
+#   - 模型仅预测目标通道 (Total_Flow, output_dim=1)。输入窗口仅含流量单通道
+#     (特征工程已删除; 运行泵数量/泵状态/泵频率/压力均不作为输入特征 —— 这些
+#     量每小时可能变化, 仅流量作为模型输入)。
+#   - 每一步: model(window) → 预测下一个时刻的流量 (标量) → 取"未来特征行"
+#     (ground-truth, 训练/评估时数据集里已有; 单通道下即未来流量真值), 把其中
+#     的目标通道替换成本轮预测值 → 拼到窗口末尾, 丢掉最旧一行, 滑窗前进一步
+#     → 预测下一时刻。
+#   - 单通道 (仅流量): future_exog 的唯一通道就是目标通道, 每步被本轮预测覆盖,
+#     即纯单变量自回归 (无外生通道需 teacher forcing 补齐)。
 #   - detach_feedback: True (默认) —— 回灌到下一步输入的预测值 detach, 梯度
 #     只训练当前步; 这样模型仍能看到"自己上一轮的预测"作为上下文 (缓解
 #     exposure bias), 又避免 24 步 BPTT 的显存/数值不稳定。设 False 则完整
 #     BPTT (梯度穿过整条 rollout 链, 显存按 horizon 倍增)。
 #
-# 其余 (数据清洗 / 特征工程 / 评估管线 / 画图 / 按起点时刻统计) 与
-# train_transformer.py 完全一致, 仅替换"前向输出方式"。
+# 其余 (数据清洗 / 评估管线 / 画图 / 按起点时刻统计) 与 train_transformer.py
+# 完全一致, 仅替换"前向输出方式"。
 # ============================================================================
 
 BASE_CONFIG = {
@@ -57,11 +57,9 @@ BASE_CONFIG = {
     "encoding": "utf-8-sig",
     "resample_freq": "60min",
     "stride": 1,
-    "hampel_cols": ["Total_Flow", "Target_Pressure"],
+    "hampel_cols": ["Total_Flow"],   # 仅清洗流量 (压力/泵量测不再读取)
     "hampel_window": 48,
-    "pump_guard_steps": 1,
     "spike_ratio": 2.0,
-    "spike_guard_steps": 0,
 
     "lookback_days": 14,
     "predict_days": 1.0,
@@ -681,9 +679,9 @@ def main():
     print(f"结果目录: {os.path.join(config['base_result_dir'], config['label'])}")
     print(f"模式: 单步自回归 (horizon=1 head + 滚动 rollout, detach_feedback={config.get('detach_feedback', True)})")
 
-    # ============ 第一步: 数据加载 & 特征工程 ============
+    # ============ 第一步: 数据加载 & 清洗 (特征工程已删除) ============
     print("\n" + "=" * 80)
-    print(f" [Phase 1] 数据加载 & 特征工程 (resample_freq={config['resample_freq']})")
+    print(f" [Phase 1] 数据加载 & 清洗 (resample_freq={config['resample_freq']}, 无特征工程)")
     print("=" * 80)
 
     processor = DataProcessor(config)

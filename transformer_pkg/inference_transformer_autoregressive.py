@@ -37,8 +37,8 @@ DEFAULT_PRESSURE_ERROR_MAX = 0   # 最大压力误差
 
 # ── 日级缺口填充 (推理端专用, 不动训练共用管线 data_processing.py) ──
 # 数据跨度内每个缺失的 bin 都用"离它最近一天的同时段"原始值补齐, 见
-# FlowPredictor._fill_day_gaps。缺口无论大小一律补: 滞后特征最长 2 天, 单个缺失
-# bin 也会级联删掉其后 2 天内的行 (输入不足时会报输入长度不足)
+# FlowPredictor._fill_day_gaps。缺口无论大小一律补: 缺失 bin 会减少可用行数,
+# 严重时触发输入长度不足报错 (lookback 不足)
 
 
 # ============================================================================
@@ -55,20 +55,13 @@ DEFAULT_PRESSURE_ERROR_MAX = 0   # 最大压力误差
 #                                    horizon。与 train_transformer_autoregressive.py
 #                                    训练时的 rollout 完全配套。
 #
-# 推理端外生通道的补齐 (训练时 future_exog 用 ground-truth; 推理无未来真值, 须构造):
-#   自回归 rollout 每一步需要一个完整的"未来特征行" (与训练 make_sequences_ar 返回
-#   的 Xf 同构), 其中目标通道 (Total_Flow) 由本轮预测覆盖, 其余外生通道须自行构造:
-#     - 时间特征 (hour/dayofweek/hour_sin/cos/...): 由未来时间戳确定性地算出。
-#     - Target_Pressure: 按分时压力时段表 (DEFAULT_PRESSURE_SCHEDULE) 取目标压力。
-#     - 泵状态/频率/运行泵数量: 持平最后已知值 (hold-last; 真实未来泵调度未知)。
-#     - Total_Flow 衍生的滞后/滚动/差分特征 (lag/roll/diff/trend/volatility/
-#       flow_lag_1day/2day 等): 用"历史真值 + 已预测未来"按训练同一套
-#       add_lag_rolling_features 因果地滚动重算 —— 每预测一步就把预测流量追加以
-#       原始单位拼到清洗帧末尾, 重算特征, 取最新一行作为下一步的外生行。
-#       这与训练 (future_exog 用 ground-truth 衍生) 存在 inherent exposure gap,
-#       是自回归模型固有的, 不可避免; detach_feedback=True 训练已缓解 exposure bias。
+# 推理端未来输入的补齐:
+#   特征仅流量单通道, 自回归 rollout 每步的"未来特征行"就是本轮预测的流量
+#   (scaled, 回灌覆盖目标通道), 无外生通道需构造。压力预测 (predict_pressure)
+#   按分时压力时段表 (DEFAULT_PRESSURE_SCHEDULE) 在输出端给出, 不进模型;
+#   压力 / 泵状态 / 频率 / 运行泵数量均不读取, 不作为模型输入。
 #
-# 其余 (数据清洗 / 特征工程 / 输入三模式 / 日级缺口填充 / 按分时压力生成压力预测)
+# 其余 (数据清洗 / 输入三模式 / 日级缺口填充 / 按分时压力生成压力预测)
 # 与 inference_transformer.py 完全一致, 仅替换"前向输出方式"。
 # ============================================================================
 
@@ -80,15 +73,12 @@ class FlowPredictor:
     target_feat_idx / detach_feedback), 接受最近 lookback_days 天的原始数据, 用单步
     自回归滚动 rollout 输出未来 predict_days 天的小时级预测流量序列。
 
-    输入 DataFrame 格式与训练数据一致 (D:\\Junshan_Project\\data\\水厂2025年小时级汇总.csv 同构):
+    输入 DataFrame 格式 (D:\\Junshan_Project\\data\\水厂2025年小时级汇总.csv 同构):
       时间列:  时间 / timestamp (整点小时级, 或直接给 DatetimeIndex 索引)
-      必需列:  出厂水流量 (m³/h), 出厂水压力 (MPa)
-      可选列:  1#/6#泵运行频率 (Hz), 1#/2#/6#送水泵运行 (0/1; 缺失时泵台数按 0)
+      必需列:  出厂水流量 (m³/h)  ← 本管线只读流量, 压力/泵量测不再读取
 
-    时间跨度: 至少 lookback_days + 2 天 (最长滞后特征为 2 天, 见下注),
-              建议提供 7 天以上, 前 2 天用于填满滞后特征。
-      注: 特征里 flow_lag_2day 需要 2 天前的值, 所以只给恰好 lookback 天的
-          数据会导致滞后特征全为 NaN 被删光, 必须多带历史。
+    时间跨度: 至少 lookback_days 天 (特征工程已删除, 无滞后特征需多带历史),
+              建议提供 7 天以上以保证输入窗口充足。
       缺口处理: 数据跨度内 (首尾天按完整 24h 网格) 缺失的 bin 一律用离它最近
           的一天同时段数据补齐 (见 _fill_day_gaps), 保证时间轴连续、长度校验通过;
           仍找不到的时刻保持缺失, 由后续 dropna 兜底。
@@ -180,7 +170,7 @@ class FlowPredictor:
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
 
-        # ── 复用训练的特征工程对象 (清洗/重采样/时间/滞后特征完全一致) ──
+        # ── 复用训练的清洗对象 (清洗/重采样口径完全一致; 无特征工程) ──
         self.processor = DataProcessor(self.config)
         self.processor.feature_scaler = self.feature_scaler
         self.processor.target_scaler = self.target_scaler
@@ -282,8 +272,8 @@ class FlowPredictor:
         默认压力误差: 典型 0.02, 最大 0.03 (误差幅值在 [0.02, 0.03] 内随机取值,
         方向随机; 传 pressure_error=0 可使误差在 [0, 0.03] 内取值)。
 
-        注: 自回归 rollout 期间, 输入特征里的未来 Target_Pressure 已用同一时段表的
-        目标压力 (无误差) 补齐; 本方法在输出端再叠加误差, 仅供输出展示, 不回灌模型。
+        注: 特征仅流量单通道, Target_Pressure 不作为模型输入; 本方法在输出端按同一
+        时段表的目标压力叠加误差, 仅供输出展示, 不回灌模型。
 
         Parameters
         ----------
@@ -384,11 +374,10 @@ class FlowPredictor:
 
         重采样后的空 bin 已被 dropna 删掉 (表里没有的槽位即缺失); 跨度按完整日历天
         取网格 [首日 00:00, 末日 23:00], 跨度内每个缺失 bin 逐圈找 (d-1, d+1,
-        d-2, d+2, ...) 取第一个该时刻有原始数据的一天, 整行复制 (流量/压力/泵数)。
+        d-2, d+2, ...) 取第一个该时刻有原始数据的一天, 整行复制 (仅流量)。
 
-        为什么缺口无论大小一律补: 滞后特征最长 2 天, 单个缺失 bin 会让其后 2 天内
-        的行因滞后特征 NaN 被 dropna 级联删除——输入不足时触发输入长度报错。
-        补齐后时间轴连续, 特征计算正常。
+        为什么缺口无论大小一律补: 缺失 bin 会减少可用行数, 严重时触发输入长度
+        报错 (lookback 不足); 补齐后时间轴连续, 输入窗口充足。
 
         输入数据所有天都缺的时刻保持缺失, 由后续 dropna 与输入长度校验兜底。
         源只取原始数据 (填充结果不参与做源)。已有值一律不动。
@@ -441,28 +430,27 @@ class FlowPredictor:
         df = df.sort_index()
         print(f"[predict-AR] 输入数据: {df.index.min()} ~ {df.index.max()}, {len(df)} 行")
 
-        # ── ① 清洗 + 特征工程 (与训练完全相同; 单段整体清洗, 无 train/test 切分) ──
+        # ── ① 清洗 (与训练完全相同; 单段整体清洗, 无 train/test 切分) ──
+        #    特征工程已删除: 模型输入仅 Total_Flow 单通道 (无时间/滞后/滚动特征)。
         df_base = self.processor.build_base_features(df)
         df_clean = self.processor.clean_and_resample(df_base)
         # 日级缺口填充: 某天缺失大量 bin 时, 用最近一天同时段数据补齐 (推理端专用)
         df_clean = self._fill_day_gaps(df_clean)
-        df_time = self.processor.add_time_features(df_clean)
-        df_feat = self.processor.add_lag_rolling_features(df_time)   # 内含 dropna
 
         # 校验特征列与训练一致 (输入格式不同会导致特征集合不同)
-        missing = [c for c in self.feature_cols if c not in df_feat.columns]
+        missing = [c for c in self.feature_cols if c not in df_clean.columns]
         if missing:
             raise ValueError(
                 f"特征列与训练不一致, 缺失: {missing[:5]}...\n"
                 f"请检查输入数据列与训练数据 (水厂2025年小时级汇总.csv) 是否同构")
-        df_feat = df_feat[self.feature_cols]
+        df_feat = df_clean[self.feature_cols]
 
         if len(df_feat) < self.lookback_steps:
             raise ValueError(
-                f"输入历史不足: 清洗+特征工程后仅剩 {len(df_feat)} 行, "
+                f"输入历史不足: 清洗后仅剩 {len(df_feat)} 行, "
                 f"模型需要 ≥ {self.lookback_steps} 行 (lookback={self.lookback_days}天)。\n"
-                f"最长滞后特征为 2 天, 建议提供 ≥ {self.lookback_days + 2} 天的原始数据。")
-        print(f"[predict-AR] 清洗+特征工程后: {len(df_feat)} 行 "
+                f"特征工程已删除 (无滞后特征), 提供 ≥ lookback 天的原始数据即可。")
+        print(f"[predict-AR] 清洗后: {len(df_feat)} 行 "
               f"({df_feat.index.min()} ~ {df_feat.index.max()})")
 
         # ── ② 取最后 lookback_steps 行作为模型输入窗口 (scaled) ──
@@ -471,21 +459,16 @@ class FlowPredictor:
         window = torch.from_numpy(X).unsqueeze(0).to(self.device)   # (1, L, C)
 
         # ── ③ 单步自回归滚动 rollout (与训练 autoregressive_rollout 配套) ──
-        # 训练时 future_exog 用 ground-truth; 推理无未来真值, 用下面构造的外生行:
-        #   时间特征由时间戳算; 压力用分时时段表; 泵状态/频率持平最后已知值;
-        #   Total_Flow 衍生的滞后/滚动特征用"历史真值 + 已预测未来"因果滚动重算。
+        # 特征仅流量单通道: 每步预测下一时刻流量, 回灌为窗口最新一行 (覆盖目标
+        # 通道), 滑窗前进一步, 循环滚出整条 horizon。无外生通道需构造 (压力/
+        # 泵状态/泵频率均不作为输入特征; 压力预测由 predict_pressure 按分时时段表
+        # 在输出端给出, 不进模型)。
         last_ts = df_clean.index[-1]
         future_idx = pd.date_range(
             start=last_ts + pd.Timedelta(minutes=self.freq_minutes),
             periods=self.predict_steps, freq=self.resample_freq)
 
-        # 清洗帧 (原始单位) 用于逐步追加预测行并重算特征; 复制最后一行作为
-        # 未来外生行的模板 (泵状态/频率/运行泵数量等非流量列持平最后已知值)。
-        df_clean_ext = df_clean.copy()
-        last_row_tmpl = df_clean.iloc[-1].copy()
-
         preds_scaled = []   # 每步预测 (target 域, scaled), 末尾统一反归一化
-        pump_cols = [c for c in df_clean.columns if "泵运行" in c and "频率" not in c]
 
         with torch.no_grad():
             for k in range(self.predict_steps):
@@ -494,31 +477,10 @@ class FlowPredictor:
                 pred_scaled = float(one[0, 0, 0].cpu().numpy())
                 preds_scaled.append(pred_scaled)
 
-                # 反归一化得原始流量单位 (供追加到清洗帧以重算衍生的滞后/滚动特征)
-                pred_flow_real = float(
-                    self.processor.inverse_transform_targets(
-                        np.array([[[pred_scaled]]], dtype=np.float32))[0, 0, 0])
-
-                # 构造未来第 k 步的外生行 (原始单位): 复制最后行模板, 覆盖流量与压力
-                ts_k = future_idx[k]
-                new_row = last_row_tmpl.copy()
-                new_row["Total_Flow"] = pred_flow_real
-                new_row["Target_Pressure"] = self._pressure_target(ts_k, self.pressure_schedule)
-                # 运行泵数量/泵状态/频率: 持平最后已知值 (new_row 已从 last_row_tmpl 继承)
-
-                # 追加到清洗帧, 重算时间/滞后滚动特征, 取最新一行 (即未来第 k 步特征行)
-                df_clean_ext.loc[ts_k] = new_row
-                df_time_ext = self.processor.add_time_features(df_clean_ext)
-                df_feat_ext = self.processor.add_lag_rolling_features(df_time_ext)  # 内含 dropna
-                next_feat = df_feat_ext[self.feature_cols].iloc[-1].values.astype(np.float32)
-
-                # scaled 特征行; 覆盖目标通道为本轮预测 (与训练 rollout 一致)
-                next_feat_scaled = self.feature_scaler.transform(next_feat.reshape(1, -1))[0]
-                next_feat_scaled[self.target_feat_idx] = pred_scaled
-
-                # 滑窗: 丢最旧一行, 末尾拼上未来第 k 步特征行
+                # 单通道: 未来第 k 步特征行即本轮预测 (scaled), 直接回灌滑窗
                 next_row_t = torch.from_numpy(
-                    next_feat_scaled.astype(np.float32)).view(1, 1, -1).to(self.device)
+                    np.array([pred_scaled], dtype=np.float32)
+                ).view(1, 1, -1).to(self.device)
                 window = torch.cat([window[:, 1:, :], next_row_t], dim=1)
 
         # ── ④ 反归一化整条预测序列 (与训练 evaluate 同口径) ──

@@ -58,11 +58,9 @@ BASE_CONFIG = {
     "encoding": "utf-8-sig",
     "resample_freq": "60min",      # 已是整点, 重采样为恒等操作
     "stride": 1,
-    "hampel_cols": ["Total_Flow", "Target_Pressure"],
+    "hampel_cols": ["Total_Flow"],   # 仅清洗流量 (压力/泵量测不再读取)
     "hampel_window": 48,           # Hampel 窗口 (整点, 2 天)
-    "pump_guard_steps": 1,         # Hampel: 泵切换前后 ±1 个整点不判异常
     "spike_ratio": 2.0,            # 突变流量判据: 比两参考点同时高 k 倍 (或低 1/k) 判异常
-    "spike_guard_steps": 0,        # 突变规则: 仅泵切换整点本身受保护 (±1h 会罩住每日 7:00 切换的早高峰)
 
     "lookback_days": 14,            # 回看窗口 (天, 60min → 24 步)
     "predict_days": 1.0,           # 预测窗口 (天, 60min → 24 步)
