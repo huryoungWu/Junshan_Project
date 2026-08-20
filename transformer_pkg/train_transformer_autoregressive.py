@@ -65,7 +65,7 @@ BASE_CONFIG = {
 
     "lookback_days": 14,
     "predict_days": 1.0,
-    "label": "junshan_L1D_P24H_1h_itransformer_autoregressive",
+    "label": "junshan_L1D_P24H_1h_itransformer_autoregressive_test",
 
     "test_days": 30,
 
@@ -73,7 +73,7 @@ BASE_CONFIG = {
     "target_transform": None,
 
     # ── Transformer 架构超参 (head 改为单步: horizon=1 在工厂里固定) ──
-    "d_model": 128,
+    "d_model": 32,
     "nhead": 4,
     "num_layers": 3,
     "dim_feedforward": 256,
@@ -87,10 +87,10 @@ BASE_CONFIG = {
     # 训练超参 (自回归 rollout 每步一次 forward, horizon=24 → 每 batch 24 次
     # forward; batch 降到 16 以控显存)
     "batch_size": 16,
-    "epochs": 500,
+    "epochs": 40,
     "learning_rate": 5e-4,
     "weight_decay": 1e-4,
-    "patience": 20,
+    "patience": 10,
     "min_delta": 1e-4,
 
     "T_0": 30,
