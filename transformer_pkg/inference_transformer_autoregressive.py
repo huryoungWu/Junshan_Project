@@ -56,10 +56,12 @@ DEFAULT_PRESSURE_ERROR_MAX = 0   # 最大压力误差
 #                                    训练时的 rollout 完全配套。
 #
 # 推理端未来输入的补齐:
-#   特征仅流量单通道, 自回归 rollout 每步的"未来特征行"就是本轮预测的流量
-#   (scaled, 回灌覆盖目标通道), 无外生通道需构造。压力预测 (predict_pressure)
-#   按分时压力时段表 (DEFAULT_PRESSURE_SCHEDULE) 在输出端给出, 不进模型;
-#   压力 / 泵状态 / 频率 / 运行泵数量均不读取, 不作为模型输入。
+#   特征 = Total_Flow + 日历特征 (hour_sin/cos, dayofweek, is_weekend, 由时间
+#   索引确定性生成, 与训练 data_processing.add_calendar_features 同源)。自回归
+#   rollout 每步的"未来特征行": 日历特征用真值 (时刻确定、精确可知), 目标通道
+#   覆盖为本轮预测的流量 (scaled, 回灌), 与训练 rollout 的 future_exog 口径一致。
+#   压力预测 (predict_pressure) 按分时压力时段表 (DEFAULT_PRESSURE_SCHEDULE)
+#   在输出端给出, 不进模型; 压力 / 泵状态 / 频率 / 运行泵数量均不读取。
 #
 # 其余 (数据清洗 / 输入三模式 / 日级缺口填充 / 按分时压力生成压力预测)
 # 与 inference_transformer.py 完全一致, 仅替换"前向输出方式"。
@@ -431,11 +433,12 @@ class FlowPredictor:
         print(f"[predict-AR] 输入数据: {df.index.min()} ~ {df.index.max()}, {len(df)} 行")
 
         # ── ① 清洗 (与训练完全相同; 单段整体清洗, 无 train/test 切分) ──
-        #    特征工程已删除: 模型输入仅 Total_Flow 单通道 (无时间/滞后/滚动特征)。
         df_base = self.processor.build_base_features(df)
         df_clean = self.processor.clean_and_resample(df_base)
         # 日级缺口填充: 某天缺失大量 bin 时, 用最近一天同时段数据补齐 (推理端专用)
         df_clean = self._fill_day_gaps(df_clean)
+        # 日历特征: 与训练同源生成 (时刻 → hour_sin/cos + dayofweek + is_weekend)
+        df_clean = self.processor.add_calendar_features(df_clean)
 
         # 校验特征列与训练一致 (输入格式不同会导致特征集合不同)
         missing = [c for c in self.feature_cols if c not in df_clean.columns]
@@ -459,14 +462,21 @@ class FlowPredictor:
         window = torch.from_numpy(X).unsqueeze(0).to(self.device)   # (1, L, C)
 
         # ── ③ 单步自回归滚动 rollout (与训练 autoregressive_rollout 配套) ──
-        # 特征仅流量单通道: 每步预测下一时刻流量, 回灌为窗口最新一行 (覆盖目标
-        # 通道), 滑窗前进一步, 循环滚出整条 horizon。无外生通道需构造 (压力/
-        # 泵状态/泵频率均不作为输入特征; 压力预测由 predict_pressure 按分时时段表
-        # 在输出端给出, 不进模型)。
+        # 每步预测下一时刻流量, 回灌为窗口最新一行: 目标通道覆盖为本轮预测,
+        # 日历特征用真值 (future_feat_scaled), 滑窗前进一步, 循环滚出整条
+        # horizon。压力/泵状态/泵频率均不作为输入特征 (压力预测由
+        # predict_pressure 按分时时段表在输出端给出, 不进模型)。
         last_ts = df_clean.index[-1]
         future_idx = pd.date_range(
             start=last_ts + pd.Timedelta(minutes=self.freq_minutes),
             periods=self.predict_steps, freq=self.resample_freq)
+
+        # 未来特征行: 日历特征由时刻确定性生成 (真值), 目标通道每步被预测覆盖
+        # (占位 0 即可), 与训练 autoregressive_rollout 的 future_exog 口径一致。
+        future_feat_raw = self.processor.add_calendar_features(pd.DataFrame(index=future_idx))
+        future_feat_raw[self.target_cols[0]] = 0.0
+        future_feat_scaled = self.feature_scaler.transform(
+            future_feat_raw[self.feature_cols].values.astype(np.float32))   # (H, C)
 
         preds_scaled = []   # 每步预测 (target 域, scaled), 末尾统一反归一化
 
@@ -477,10 +487,11 @@ class FlowPredictor:
                 pred_scaled = float(one[0, 0, 0].cpu().numpy())
                 preds_scaled.append(pred_scaled)
 
-                # 单通道: 未来第 k 步特征行即本轮预测 (scaled), 直接回灌滑窗
+                # 未来第 k 步特征行: 日历特征用真值, 目标通道覆盖为本轮预测 (回灌)
+                next_row = future_feat_scaled[k].copy()
+                next_row[self.target_feat_idx] = pred_scaled
                 next_row_t = torch.from_numpy(
-                    np.array([pred_scaled], dtype=np.float32)
-                ).view(1, 1, -1).to(self.device)
+                    next_row.astype(np.float32)).view(1, 1, -1).to(self.device)
                 window = torch.cat([window[:, 1:, :], next_row_t], dim=1)
 
         # ── ④ 反归一化整条预测序列 (与训练 evaluate 同口径) ──

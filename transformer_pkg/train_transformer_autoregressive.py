@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import math
 import pickle
@@ -8,6 +9,12 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+# GBK 控制台/重定向文件无法编码 ⚠ 等非 GBK 字符 → 统一改用 UTF-8 输出
+if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import torch
 import torch.nn as nn
@@ -34,15 +41,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 #                           整个 horizon。训练与评估都用同一套自回归 rollout。
 #
 # 自回归 rollout 细节:
-#   - 模型仅预测目标通道 (Total_Flow, output_dim=1)。输入窗口仅含流量单通道
-#     (特征工程已删除; 运行泵数量/泵状态/泵频率/压力均不作为输入特征 —— 这些
-#     量每小时可能变化, 仅流量作为模型输入)。
+#   - 模型仅预测目标通道 (Total_Flow, output_dim=1)。输入窗口 = Total_Flow +
+#     日历特征 (hour_sin/cos, dayofweek, is_weekend, 由 data_processing.
+#     add_calendar_features 由时刻确定性生成; 运行泵数量/泵状态/泵频率/压力
+#     均不作为输入特征 —— 这些量每小时可能变化, 不进模型)。
 #   - 每一步: model(window) → 预测下一个时刻的流量 (标量) → 取"未来特征行"
-#     (ground-truth, 训练/评估时数据集里已有; 单通道下即未来流量真值), 把其中
-#     的目标通道替换成本轮预测值 → 拼到窗口末尾, 丢掉最旧一行, 滑窗前进一步
-#     → 预测下一时刻。
-#   - 单通道 (仅流量): future_exog 的唯一通道就是目标通道, 每步被本轮预测覆盖,
-#     即纯单变量自回归 (无外生通道需 teacher forcing 补齐)。
+#     (ground-truth, 训练/评估时数据集里已有; 日历特征本来就是确定性的真值),
+#     把其中的目标通道替换成本轮预测值 → 拼到窗口末尾, 丢掉最旧一行, 滑窗
+#     前进一步 → 预测下一时刻。
+#   - 目标通道每步被本轮预测覆盖 → 纯单变量自回归; 日历特征作为外生通道用
+#     真值补齐 (时刻确定, 无需预测, 天然 teacher forcing)。
 #   - detach_feedback: True (默认) —— 回灌到下一步输入的预测值 detach, 梯度
 #     只训练当前步; 这样模型仍能看到"自己上一轮的预测"作为上下文 (缓解
 #     exposure bias), 又避免 24 步 BPTT 的显存/数值不稳定。设 False 则完整
@@ -61,7 +69,7 @@ BASE_CONFIG = {
     "hampel_window": 48,
     "spike_ratio": 2.0,
 
-    "lookback_days": 14,
+    "lookback_days": 7,
     "predict_days": 1.0,
     "label": "junshan_L1D_P24H_1h_itransformer_autoregressive_test",
 
@@ -168,8 +176,8 @@ def autoregressive_rollout(model, src, future_exog, predict_steps,
     输入:
       src          : (B, L, C) ground-truth 回看窗口 (feature 域)
       future_exog  : (B, H, C) 未来 H 步的 ground-truth 外生特征行; 其中目标通道
-                     (target_feat_idx) 会被本轮预测值覆盖, 其余通道用真值 (外生
-                     teacher forcing)
+                     (target_feat_idx) 会被本轮预测值覆盖, 其余通道 (日历特征等)
+                     用真值 (外生 teacher forcing)
       target_feat_idx: 目标通道在 C 维的下标 (Total_Flow 在 feature_cols 中的位置)
       detach_feedback: True → 回灌预测值 detach, 梯度只训练当前步 (省显存, 稳定);
                        False → 完整 BPTT, 梯度穿过整条 rollout 链
@@ -657,6 +665,8 @@ def main():
                         help="模型类型 (默认 None = 用 BASE_CONFIG['model_type'])")
     parser.add_argument("--label", default=None,
                         help="结果子目录名 (默认 None = 用 BASE_CONFIG['label'])")
+    parser.add_argument("--lookback", type=float, default=None,
+                        help="回看天数 (默认 None = 用 BASE_CONFIG['lookback_days']; 最优基线为 14 天)")
     # --detach-feedback / --no-detach-feedback: 切换回灌预测值是否 detach
     #   默认 (detach_feedback=True): 回灌 detach, 梯度只训练当前步 (稳定省显存)
     #   --no-detach-feedback: 完整 BPTT, 梯度穿过整条 rollout 链 (显存按 horizon 倍增)
@@ -670,6 +680,8 @@ def main():
         config["model_type"] = args.model
     if args.label is not None:
         config["label"] = args.label
+    if args.lookback is not None:
+        config["lookback_days"] = args.lookback
     if args.detach_feedback is not None:
         config["detach_feedback"] = args.detach_feedback
     set_seed(config["seed"])

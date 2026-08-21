@@ -11,8 +11,9 @@ import torch.nn as nn
 #   vanilla Transformer 把"时间步"当 token, 对时间做 attention;
 #   iTransformer 反过来——把"每个变量的一条序列"当 token, 对变量做 attention,
 #   时间依赖交给逐变量的 MLP 嵌入 (Linear(L → d_model)), 预测时每变量独立出整个
-#   horizon。本项目输入是 ~96 维特征 (流量 + 时间特征 + 滞后/滚动统计), 跨变量
-#   attention 天然适配多特征结构。
+#   horizon。本项目输入是 5 维特征 (流量 + 日历特征 hour_sin/hour_cos/
+#   dayofweek/is_weekend), 5 个变量 token 做跨变量 attention —— 注意单通道
+#   (C=1) 时 attention 退化为恒等, 整个 encoder 只剩逐 token MLP, 无意义。
 #
 # 接口与 TimeSeriesTransformer 完全一致 (src, target_len, tgt, teacher_forcing_ratio),
 # 以便共用 train_transformer.py / inference_transformer.py 的训练与评估循环;

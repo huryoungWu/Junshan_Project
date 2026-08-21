@@ -25,7 +25,9 @@ from sklearn.preprocessing import StandardScaler
 #      (在 Hampel 之前执行, 命中整点以插值值保留)
 #   2. Hampel 离群清洗 (窗口 2 天整点) + 流量物理界限裁剪 (0~10000)
 #   3. 重采样 (60min, 已是整点 → 恒等) + 删除空 bin (空洞不虚构)
-#   4. 模型输入仅 Total_Flow 单通道 (feature_cols = ["Total_Flow"])
+#   4. 模型输入 = Total_Flow + 日历特征 (hour_sin/cos, dayofweek, is_weekend,
+#      由时间索引确定性生成, 见 CALENDAR_COLS / add_calendar_features;
+#      压力 / 泵量测仍不读不算)
 #   5. 按时间划分训练/测试集 (split_by_time) 与归一化 (scaler 由训练端拟合并保存)
 #   6. 序列窗口生成 (make_sequences) 与 SeqDataset
 #
@@ -37,6 +39,12 @@ from sklearn.preprocessing import StandardScaler
 HAMPEL_WINDOW     = 48      # 滚动窗口 (整点, 2 天; 小时级数据, 可在 config 覆盖)
 HAMPEL_K          = 10.0    # 遂值: |x - 局部中位数| > k * scale 判为异常
 MAD_FLOOR_RATIO   = 0.02    # scale 下限 = 局部中位数的 2% (防 MAD≈0 误报)
+
+# ==================== 日历特征 (训练/推理共用, 由时间索引确定性生成) ====================
+# 小时相位 sin/cos 双通道 (24h 周期, 平滑 23→0 跨越) + 星期几 + 周末标记。
+# 水厂流量有强日周期与周模式 (工作日/周末差异), 显式给模型省去从流量里硬猜时刻。
+# 由时刻唯一确定: 训练/推理/未来 rollout 同源生成, 值精确可知, 不需模型预测。
+CALENDAR_COLS = ["hour_sin", "hour_cos", "dayofweek", "is_weekend"]
 
 
 def needed_csv_columns(header):
@@ -77,6 +85,27 @@ class DataProcessor:
         self.target_scaler = StandardScaler()
         self.target_cols = ["Total_Flow"]
         self.feature_cols = None
+
+    def add_calendar_features(self, df):
+        """给带 DatetimeIndex 的 df 追加日历特征列 (返回新 df, 不修改入参)。
+
+        列 (见 CALENDAR_COLS):
+          hour_sin / hour_cos : 小时相位 sin/cos 编码 (24h 周期, 平滑 23→0 跨越)
+          dayofweek           : 星期几 0(周一)~6(周日)
+          is_weekend          : 是否周末 (0/1)
+
+        日历特征由时刻唯一确定: 训练 / 推理 / 未来 rollout 都用同一份代码生成,
+        口径一致; 未来时刻的值精确可知, 自回归 rollout 中作为外生通道用真值,
+        不需要模型预测。改动特征集合后必须重新训练 (见模块头注释)。
+        """
+        out = df.copy()
+        h = out.index.hour.to_numpy()
+        out["hour_sin"] = np.sin(2.0 * np.pi * h / 24.0).astype(np.float32)
+        out["hour_cos"] = np.cos(2.0 * np.pi * h / 24.0).astype(np.float32)
+        dow = out.index.dayofweek.to_numpy()
+        out["dayofweek"] = dow.astype(np.float32)
+        out["is_weekend"] = (dow >= 5).astype(np.float32)
+        return out
 
     def load_raw(self):
         file_path = self.config["file_path"]
@@ -250,9 +279,9 @@ class DataProcessor:
         df_clean = pd.concat([self.clean_and_resample(df_base_train),
                               self.clean_and_resample(df_base_test)])
 
-        # 模型输入仅 Total_Flow 单通道 (无特征工程, 无压力/泵量测)。
-        df_feat = df_clean
-        self.feature_cols = ["Total_Flow"]
+        # 日历特征: 由时间索引确定性生成, 训练/推理共用同一方法 (无压力/泵量测)。
+        df_feat = self.add_calendar_features(df_clean)
+        self.feature_cols = ["Total_Flow"] + list(CALENDAR_COLS)
         return df_feat
 
     def split_by_time(self, df):
