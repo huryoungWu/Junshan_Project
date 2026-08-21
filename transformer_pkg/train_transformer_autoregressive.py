@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from tqdm import tqdm
 
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
@@ -64,7 +65,7 @@ BASE_CONFIG = {
     "file_path": r"D:\Junshan_Project\data\水厂2025年小时级汇总.csv",
     "encoding": "utf-8-sig",
     "resample_freq": "60min",
-    "stride": 1,
+    "stride": 6,
     "hampel_cols": ["Total_Flow"],   # 仅清洗流量 (压力/泵量测不再读取)
     "hampel_window": 48,
     "spike_ratio": 2.0,
@@ -85,7 +86,7 @@ BASE_CONFIG = {
     "dim_feedforward": 256,
     "transformer_dropout": 0.2,
 
-    "model_type": "itransformer",  # transformer | itransformer
+    "model_type": "transformer",  # transformer | itransformer
 
     # 自回归专用: 回灌的预测值是否 detach (True=稳定省显存, False=完整 BPTT)
     "detach_feedback": True,
@@ -212,7 +213,8 @@ def evaluate(model, loader, device, processor, predict_steps,
     all_preds, all_trues = [], []
 
     with torch.no_grad():
-        for batch_x, batch_y, batch_xf in loader:
+        for batch_x, batch_y, batch_xf in tqdm(loader, desc="Evaluating",
+                                                unit="batch", leave=False):
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
             batch_xf = batch_xf.to(device)
@@ -506,18 +508,19 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     early_stopper = EarlyStopping(cfg["patience"], cfg["min_delta"])
 
     best_state = None
-    best_test_loss = float("inf")
+    best_test_mape = float("inf")
     history = []
 
     print(f"\n  Training(自回归): {label}")
-    print(f"  {'Epoch':<8}{'TrainLoss':<15}{'TestLoss':<15}{'FlowMAE':<12}{'FlowRMSE':<12}{'FlowMAPE':<12}{'LR':<12}")
-    print(f"  {'-'*90}")
 
-    for epoch in range(1, cfg["epochs"] + 1):
+    epoch_pbar = tqdm(range(1, cfg["epochs"] + 1), desc="Epochs", unit="epoch")
+    for epoch in epoch_pbar:
         model.train()
         train_loss_sum = 0.0
 
-        for batch_x, batch_y, batch_xf in train_loader:
+        batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg['epochs']}",
+                          unit="batch", leave=False)
+        for batch_x, batch_y, batch_xf in batch_pbar:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
             batch_xf = batch_xf.to(device)
@@ -531,6 +534,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             train_loss_sum += loss.item() * len(batch_x)
+            batch_pbar.set_postfix(loss=f"{loss.item():.6f}")
 
         train_loss = train_loss_sum / len(train_loader.dataset)
         test_metrics = evaluate(model, test_loader, device, processor, predict_steps,
@@ -545,14 +549,21 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
             "flow_mape": test_metrics["flow_mape"], "lr": lr_now
         })
 
-        print(f"  {epoch:<8}{train_loss:<15.6f}{test_loss:<15.6f}{test_metrics['flow_mae']:<12.4f}{test_metrics['flow_rmse']:<12.4f}{test_metrics['flow_mape']:<12.2f}{lr_now:<12.6f}")
+        # 更新 epoch 进度条后缀, 显示关键指标
+        epoch_pbar.set_postfix(
+            train_loss=f"{train_loss:.6f}",
+            test_loss=f"{test_loss:.6f}",
+            MAPE=f"{test_metrics['flow_mape']:.2f}%",
+            lr=f"{lr_now:.6f}"
+        )
 
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
+        current_mape = test_metrics["flow_mape"]
+        if current_mape < best_test_mape:
+            best_test_mape = current_mape
             best_state = deepcopy(model.state_dict())
             torch.save(best_state, os.path.join(result_dir, "best_seq2seq_model.pth"))
 
-        if early_stopper.step(test_loss):
+        if early_stopper.step(current_mape):
             print(f"\n  Early stopping at epoch={epoch}")
             break
 
@@ -645,7 +656,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         "detach_feedback": detach_feedback,
         "n_train_samples": len(X_train),
         "n_test_samples": len(X_test),
-        "best_epoch": int(history_df.loc[history_df["test_loss"].idxmin(), "epoch"]),
+        "best_epoch": int(history_df.loc[history_df["flow_mape"].idxmin(), "epoch"]),
         "train_loss": train_metrics["loss"],
         "test_loss": test_metrics["loss"],
         "train_mae": train_metrics["flow_mae"],
