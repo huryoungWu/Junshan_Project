@@ -1,19 +1,11 @@
-"""指定窗口评估: 选择起始日期, 逐日预测并用多种残差修正方法对比。
+"""EWMA 残差修正评估: 选择起始日期, 逐日预测并用指数加权移动平均 (EWMA) 修正。
 
 用法:
-  # 单天模式
-  python eval_random_window.py --start_date 2025-10-01
-
-  # 全天模式 + 默认方案一 (滑动窗口)
-  python eval_random_window.py --start_date 2025-01-08 --all_days
-
-  # 指定修正方法
-  python eval_random_window.py --start_date 2025-01-08 --all_days --correction_method arima
-  python eval_random_window.py --start_date 2025-01-08 --all_days --correction_method ewma
-  python eval_random_window.py --start_date 2025-01-08 --all_days --correction_method stl
-
-  # 对比全部方法
-  python eval_random_window.py --start_date 2025-01-08 --all_days --correction_method all
+  python eval_random_window_ewma.py --start_date 2025-10-01
+  python eval_random_window_ewma.py --start_date 2025-01-08 --all_days
+  python eval_random_window_ewma.py --start_date 2025-01-08 --all_days --ewma_alpha 0.15
+  python eval_random_window_ewma.py --start_date 2025-01-08 --all_days --ewma_alpha 0.0
+  python eval_random_window_ewma.py --seed 42
 """
 
 import os
@@ -48,104 +40,27 @@ DEFAULT_RESULT_DIR = os.path.join(HERE, "results",
                                   "junshan_L1D_P24H_1h_itransformer_autoregressive_test")
 
 
-# ==================== 四种残差修正方法 ====================
+def correct_day_ewma(pred_day, true_day, ewma_state):
+    """EWMA 残差修正: r̂_t = α·r_{t-1} + (1-α)·r̂_{t-1}
 
-def correct_day_sliding_window(pred_day, true_day, history, window=168):
-    """方案一: 滑动窗口残差修正 — 用最近 window 个残差的均值修正。"""
-    corrected = np.zeros_like(pred_day)
-    for h in range(len(pred_day)):
-        w = min(window, len(history))
-        mean_res = np.mean(history[-w:]) if w > 0 else 0.0
-        corrected[h] = pred_day[h] + mean_res
-        history.append(true_day[h] - pred_day[h])
-    return corrected
+    Args:
+        pred_day:    当天原始预测 (predict_steps,)
+        true_day:    当天真实值 (predict_steps,)
+        ewma_state:  dict, keys: ewma_val (float), alpha (float)
 
-
-def correct_day_ewma(pred_day, true_day, state, alpha=0.2):
-    """方案四: 指数加权移动平均 (EWMA) 修正 — 给近期残差更高权重。
-
-    state: dict with keys:
-      ewma_val: 当前 EWMA 值 (float)
-      alpha:    衰减因子
+    Returns:
+        corrected:   修正后预测 (predict_steps,)
     """
-    ewma_val = state["ewma_val"]
+    ewma_val = ewma_state["ewma_val"]
+    alpha = ewma_state["alpha"]
     corrected = np.zeros_like(pred_day)
     for h in range(len(pred_day)):
         corrected[h] = pred_day[h] + ewma_val
         r = true_day[h] - pred_day[h]
         ewma_val = alpha * r + (1 - alpha) * ewma_val
-    state["ewma_val"] = ewma_val
+    ewma_state["ewma_val"] = ewma_val
     return corrected
 
-
-def correct_day_arima(pred_day, true_day, history):
-    """方案二: ARIMA 残差建模 — 每天拟合一次 ARIMA(1,0,0), 用预测残差修正当天所有小时。
-
-    需要至少 24 个历史残差点; 不足时回退到均值修正。
-    """
-    from statsmodels.tsa.arima.model import ARIMA
-
-    n_hours = len(pred_day)
-    if len(history) >= 24:
-        try:
-            model = ARIMA(history, order=(1, 0, 0))
-            fit = model.fit()
-            forecasts = fit.forecast(steps=n_hours)
-        except Exception:
-            forecasts = np.full(n_hours, np.mean(history[-min(48, len(history)):]))
-    else:
-        mean_r = np.mean(history) if len(history) > 0 else 0.0
-        forecasts = np.full(n_hours, mean_r)
-
-    corrected = pred_day + forecasts
-    # 追加真实残差到历史
-    residuals = true_day - pred_day
-    history.extend(residuals.tolist())
-    return corrected
-
-
-def correct_day_stl(pred_day, true_day, history, period=24):
-    """方案三: STL 季节性分解 + 残差修正 — 每天对残差做 STL 分解,
-    用趋势外推 + 季节性模式修正当天所有小时。
-
-    需要至少 2*period 个历史残差点; 不足时回退到均值修正。
-    """
-    from statsmodels.tsa.seasonal import STL
-
-    n_hours = len(pred_day)
-    min_needed = 2 * period
-    if len(history) >= min_needed:
-        try:
-            res_series = pd.Series(history)
-            stl = STL(res_series, period=period, robust=True)
-            result = stl.fit()
-            seasonal = result.seasonal.values
-            trend = result.trend.values
-            # 趋势外推
-            if len(trend) >= 2:
-                trend_slope = trend[-1] - trend[-2]
-            else:
-                trend_slope = 0
-            trend_base = trend[-1]
-            # 季节性: 取最后一个完整周期
-            last_season = seasonal[-period:]
-            forecasts = np.zeros(n_hours)
-            for h in range(n_hours):
-                next_idx = (len(history) + h) % period
-                forecasts[h] = trend_base + trend_slope * (h + 1) + last_season[next_idx]
-        except Exception:
-            forecasts = np.full(n_hours, np.mean(history[-min(48, len(history)):]))
-    else:
-        mean_r = np.mean(history) if len(history) > 0 else 0.0
-        forecasts = np.full(n_hours, mean_r)
-
-    corrected = pred_day + forecasts
-    residuals = true_day - pred_day
-    history.extend(residuals.tolist())
-    return corrected
-
-
-# ==================== 工具函数 ====================
 
 def autoregressive_predict(model, window_scaled, future_feat_scaled,
                            predict_steps, target_feat_idx, device):
@@ -177,11 +92,9 @@ def calc_metrics(y_true, y_pred):
     return mae, rmse, mape
 
 
-# ==================== 主程序 ====================
-
 def main():
     parser = argparse.ArgumentParser(
-        description="指定窗口评估: 逐日预测 + 多种残差修正方法对比")
+        description="EWMA 残差修正评估: 逐日预测 + 指数加权移动平均修正")
     parser.add_argument("--data", default=DEFAULT_DATA, help="原始数据 CSV")
     parser.add_argument("--result_dir", default=DEFAULT_RESULT_DIR, help="训练结果目录")
     parser.add_argument("--lookback", type=int, default=7, help="回看天数 (默认 7)")
@@ -189,11 +102,6 @@ def main():
                         help="评估起始日期 (格式 YYYY-MM-DD, 第一个预测日)")
     parser.add_argument("--seed", type=int, default=None,
                         help="随机种子 (仅未指定 --start_date 时生效)")
-    parser.add_argument("--correction_method", default="sliding_window",
-                        choices=["sliding_window", "arima", "stl", "ewma", "all"],
-                        help="修正方法 (默认 sliding_window; all=对比全部)")
-    parser.add_argument("--correction_window", type=int, default=168,
-                        help="滑动窗口大小 (仅 sliding_window, 默认 168)")
     parser.add_argument("--ewma_alpha", type=float, default=0.2,
                         help="EWMA 衰减因子 (默认 0.2)")
     parser.add_argument("--all_days", action="store_true",
@@ -252,9 +160,8 @@ def main():
     lookback = args.lookback
     lookback_steps = lookback * points_per_day
 
-    print(f"模型: {model_type}, 训练 lookback={config['lookback_days']}d, "
-          f"评估 lookback={lookback}d, predict={predict_steps}步")
-    print(f"修正方法: {args.correction_method}")
+    print(f"模型: {model_type}, lookback={lookback}d, predict={predict_steps}步")
+    print(f"EWMA: alpha={args.ewma_alpha}")
 
     # ── 加载数据 ──
     processor = DataProcessor(config)
@@ -311,12 +218,6 @@ def main():
           f"({df_feat.index[first_pred_idx].date()} ~ "
           f"{df_feat.index[first_pred_idx + (n_predict_days-1)*points_per_day].date()})")
 
-    # ── 确定要运行的方法 ──
-    if args.correction_method == "all":
-        methods = ["sliding_window", "arima", "stl", "ewma"]
-    else:
-        methods = [args.correction_method]
-
     # ── 逐日预测 ──
     print(f"\n{'='*70}")
     print(f" 逐日预测 ({n_predict_days} 天)")
@@ -360,118 +261,93 @@ def main():
     n_actual = len(all_day_preds)
     print(f"实际预测: {n_actual} 天")
 
-    # ── 初始化各方法状态 ──
-    method_states = {}
-    for m in methods:
-        if m == "sliding_window":
-            method_states[m] = {"history": [], "window": args.correction_window}
-        elif m == "ewma":
-            method_states[m] = {"ewma_val": 0.0, "alpha": args.ewma_alpha}
-        elif m == "arima":
-            method_states[m] = {"history": []}
-        elif m == "stl":
-            method_states[m] = {"history": [], "period": points_per_day}
-
-    # ── 逐日修正 ──
-    method_all_corrected = {m: [] for m in methods}
+    # ── 逐日 EWMA 修正 ──
+    ewma_state = {"ewma_val": 0.0, "alpha": args.ewma_alpha}
+    all_day_corrected = []
 
     for day in range(n_actual):
-        pred = all_day_preds[day]
-        true = all_day_trues[day]
+        corr = correct_day_ewma(all_day_preds[day], all_day_trues[day], ewma_state)
+        all_day_corrected.append(corr)
 
-        for m in methods:
-            st = method_states[m]
-            if m == "sliding_window":
-                corr = correct_day_sliding_window(pred, true, st["history"], st["window"])
-            elif m == "ewma":
-                corr = correct_day_ewma(pred, true, st)
-            elif m == "arima":
-                corr = correct_day_arima(pred, true, st["history"])
-            elif m == "stl":
-                corr = correct_day_stl(pred, true, st["history"], st["period"])
-            method_all_corrected[m].append(corr)
-
-    # ── 汇总指标 ──
-    all_true = np.concatenate(all_day_trues)
-    all_orig = np.concatenate(all_day_preds)
-    o_all = calc_metrics(all_true, all_orig)
-
-    method_metrics = {}
-    for m in methods:
-        all_corr = np.concatenate(method_all_corrected[m])
-        method_metrics[m] = calc_metrics(all_true, all_corr)
-
-    # ── 打印每天指标对比 (每天一行, 所有方法) ──
+    # ── 每天指标对比 ──
     print(f"\n{'='*70}")
-    print(f" 每天 MAE 对比")
+    print(f" 每天指标对比 (EWMA alpha={args.ewma_alpha})")
     print(f"{'='*70}")
 
-    method_labels = {
-        "sliding_window": f"滑动窗口(w={args.correction_window})",
-        "arima": "ARIMA(1,0,0)",
-        "stl": f"STL(period={points_per_day})",
-        "ewma": f"EWMA(α={args.ewma_alpha})",
-    }
-
-    hdr = f"  {'日期':<12}{'原始':<10}"
-    for m in methods:
-        hdr += f"{method_labels[m]:<20}"
-    print(hdr)
-    print(f"  {'-' * (12 + 10 + 20 * len(methods))}")
+    # 分三个子表打印, 避免列拥挤
+    for metric_name, metric_key, fmt in [("MAE", "mae", ".1f"), ("RMSE", "rmse", ".1f"), ("MAPE%", "mape", ".2f")]:
+        print(f"\n  {metric_name}:")
+        print(f"  {'日期':<12}{'原始':<12}{'修正后':<12}{'提升':<12}")
+        print(f"  {'-'*48}")
+        for day in range(n_actual):
+            date_str = all_day_timestamps[day][0].strftime("%Y-%m-%d")
+            o_mae, o_rmse, o_mape = calc_metrics(all_day_trues[day], all_day_preds[day])
+            c_mae, c_rmse, c_mape = calc_metrics(all_day_trues[day], all_day_corrected[day])
+            orig = {"mae": o_mae, "rmse": o_rmse, "mape": o_mape}[metric_key]
+            corr = {"mae": c_mae, "rmse": c_rmse, "mape": c_mape}[metric_key]
+            imp = (1 - corr / orig) * 100 if orig > 0 else 0
+            print(f"  {date_str:<12}{orig:<12{fmt}}{corr:<12{fmt}}{imp:>+10.1f}%")
 
     day_rows = []
     for day in range(n_actual):
-        date_str = all_day_timestamps[day][0].strftime("%Y-%m-%d")
         o_mae, o_rmse, o_mape = calc_metrics(all_day_trues[day], all_day_preds[day])
-        row = {"date": date_str, "orig_mae": o_mae, "orig_rmse": o_rmse, "orig_mape": o_mape}
-        line = f"  {date_str:<12}{o_mae:<10.1f}"
-        for m in methods:
-            c_mae, c_rmse, c_mape = calc_metrics(all_day_trues[day], method_all_corrected[m][day])
-            imp = (1 - c_mae / o_mae) * 100 if o_mae > 0 else 0
-            row[f"{m}_mae"] = c_mae
-            row[f"{m}_rmse"] = c_rmse
-            row[f"{m}_mape"] = c_mape
-            row[f"{m}_mae_imp"] = imp
-            line += f"{c_mae:<10.1f}({imp:>+.1f}%){'':<6}"
-        print(line)
-        day_rows.append(row)
+        c_mae, c_rmse, c_mape = calc_metrics(all_day_trues[day], all_day_corrected[day])
+        mae_imp = (1 - c_mae / o_mae) * 100 if o_mae > 0 else 0
+        rmse_imp = (1 - c_rmse / o_rmse) * 100 if o_rmse > 0 else 0
+        mape_imp = (1 - c_mape / o_mape) * 100 if o_mape > 0 else 0
+        day_rows.append({
+            "date": all_day_timestamps[day][0].strftime("%Y-%m-%d"),
+            "orig_mae": o_mae, "corr_mae": c_mae, "mae_imp": mae_imp,
+            "orig_rmse": o_rmse, "corr_rmse": c_rmse, "rmse_imp": rmse_imp,
+            "orig_mape": o_mape, "corr_mape": c_mape, "mape_imp": mape_imp,
+        })
 
-    # ALL 行
-    print(f"  {'-' * (12 + 10 + 20 * len(methods))}")
-    line = f"  {'ALL':<12}{o_all[0]:<10.1f}"
-    for m in methods:
-        c = method_metrics[m]
-        imp = (1 - c[0] / o_all[0]) * 100
-        line += f"{c[0]:<10.1f}({imp:>+.1f}%){'':<6}"
-    print(line)
+    # ── 汇总 ──
+    all_true = np.concatenate(all_day_trues)
+    all_orig = np.concatenate(all_day_preds)
+    all_corr = np.concatenate(all_day_corrected)
+    o_all = calc_metrics(all_true, all_orig)
+    c_all = calc_metrics(all_true, all_corr)
 
-    # ── 三个指标汇总表 ──
+    print(f"  {'-'*110}")
+    print(f"  {'ALL':<12}{o_all[0]:<10.2f}{c_all[0]:<10.2f}{(1-c_all[0]/o_all[0])*100:>+10.2f}%"
+          f"{o_all[1]:<10.2f}{c_all[1]:<10.2f}{(1-c_all[1]/o_all[1])*100:>+10.2f}%"
+          f"{o_all[2]:<10.2f}{c_all[2]:<10.2f}{(1-c_all[2]/o_all[2])*100:>+10.2f}%")
+
     print(f"\n{'='*70}")
     print(f" 全量指标汇总 ({n_actual} 天)")
     print(f"{'='*70}")
-    print(f"  {'方法':<25}{'MAE':<10}{'RMSE':<10}{'MAPE%':<10}"
+    print(f"  {'方法':<15}{'MAE':<10}{'RMSE':<10}{'MAPE%':<10}"
           f"{'MAE提升':<12}{'RMSE提升':<12}{'MAPE提升':<12}")
-    print(f"  {'-'*91}")
-
-    # 原始
-    print(f"  {'原始':<25}{o_all[0]:<10.2f}{o_all[1]:<10.2f}{o_all[2]:<10.2f}"
+    print(f"  {'-'*81}")
+    print(f"  {'原始':<15}{o_all[0]:<10.2f}{o_all[1]:<10.2f}{o_all[2]:<10.2f}"
           f"{'---':<12}{'---':<12}{'---':<12}")
-
-    # 各方法
-    for m in methods:
-        c = method_metrics[m]
-        mae_imp = (1 - c[0] / o_all[0]) * 100
-        rmse_imp = (1 - c[1] / o_all[1]) * 100
-        mape_imp = (1 - c[2] / o_all[2]) * 100
-        label = method_labels[m]
-        print(f"  {label:<25}{c[0]:<10.2f}{c[1]:<10.2f}{c[2]:<10.2f}"
-              f"{mae_imp:>+10.2f}%{rmse_imp:>+10.2f}%{mape_imp:>+10.2f}%")
+    print(f"  {'EWMA(α='+str(args.ewma_alpha)+')':<15}{c_all[0]:<10.2f}{c_all[1]:<10.2f}{c_all[2]:<10.2f}"
+          f"{(1-c_all[0]/o_all[0])*100:>+10.2f}%{(1-c_all[1]/o_all[1])*100:>+10.2f}%{(1-c_all[2]/o_all[2])*100:>+10.2f}%")
 
     # ── 保存 CSV ──
     day_df = pd.DataFrame(day_rows)
-    csv_path = os.path.join(HERE, "eval_random_day_metrics.csv")
+    csv_path = os.path.join(HERE, "eval_ewma_day_metrics.csv")
     day_df.to_csv(csv_path, index=False, float_format="%.4f")
     print(f"\n每天指标已保存: {csv_path}")
+
+    # ── 保存逐小时预测 ──
+    all_records = []
+    for day in range(n_actual):
+        for h in range(predict_steps):
+            all_records.append({
+                "date": all_day_timestamps[day][0].strftime("%Y-%m-%d"),
+                "timestamp": str(all_day_timestamps[day][h]),
+                "true": float(all_day_trues[day][h]),
+                "pred": float(all_day_preds[day][h]),
+                "pred_corrected": float(all_day_corrected[day][h]),
+                "residual": float(all_day_trues[day][h] - all_day_preds[day][h]),
+                "residual_corrected": float(all_day_trues[day][h] - all_day_corrected[day][h]),
+            })
+    all_df = pd.DataFrame(all_records)
+    all_csv = os.path.join(HERE, "eval_ewma_all_predictions.csv")
+    all_df.to_csv(all_csv, index=False, float_format="%.4f")
+    print(f"全部预测已保存: {all_csv}")
 
     # ── 画图 ──
     plt.rcParams["font.sans-serif"] = ["SimHei"]
@@ -482,47 +358,41 @@ def main():
     dates = [r["date"] for r in plot_rows]
     x = np.arange(len(dates))
 
-    colors = {"sliding_window": "#3498db", "arima": "#e74c3c",
-              "stl": "#9b59b6", "ewma": "#f39c12"}
-
+    # 三指标对比
     fig, axes = plt.subplots(3, 1, figsize=(max(18, len(dates) * 0.25), 14))
-
     for ax, metric, title in zip(axes, ["mae", "rmse", "mape"], ["MAE", "RMSE", "MAPE%"]):
         orig_vals = [r[f"orig_{metric}"] for r in plot_rows]
-        ax.plot(x, orig_vals, "-", color="#2c3e50", linewidth=1.2,
-                alpha=0.8, label="原始")
-        for m in methods:
-            vals = [r[f"{m}_{metric}"] for r in plot_rows]
-            ax.plot(x, vals, "-", color=colors.get(m, "#999"), linewidth=1.0,
-                    alpha=0.8, label=method_labels[m])
+        corr_vals = [r[f"corr_{metric}"] for r in plot_rows]
+        ax.plot(x, orig_vals, "-", color="#2c3e50", linewidth=1.2, alpha=0.8, label="原始")
+        ax.plot(x, corr_vals, "-", color="#e74c3c", linewidth=1.0, alpha=0.8,
+                label=f"EWMA(α={args.ewma_alpha})")
         ax.set_xticks(x[::max(1, len(x)//20)])
         ax.set_xticklabels([d[5:] for d in dates[::max(1, len(x)//20)]], rotation=45)
         ax.set_title(title, fontsize=13)
-        ax.legend(fontsize=8, ncol=2)
+        ax.legend()
         ax.grid(alpha=0.3)
 
-    fig.suptitle(f"残差修正方法对比 ({dates[0]} ~ {dates[-1]}, {n_actual}天)", fontsize=14)
+    fig.suptitle(f"EWMA 残差修正 (α={args.ewma_alpha}) — {dates[0]} ~ {dates[-1]}, {n_actual}天",
+                 fontsize=14)
     fig.tight_layout()
-    fig_path = os.path.join(HERE, "eval_random_day_comparison.png")
+    fig_path = os.path.join(HERE, "eval_ewma_comparison.png")
     fig.savefig(fig_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"对比图已保存: {fig_path}")
 
-    # 画 MAE 提升百分比柱状图
+    # MAE 提升图
     fig2, ax2 = plt.subplots(figsize=(max(18, len(dates) * 0.25), 5))
-    for m in methods:
-        imps = [r[f"{m}_mae_imp"] for r in plot_rows]
-        ax2.plot(x, imps, "-", color=colors.get(m, "#999"), linewidth=1.0,
-                 alpha=0.8, label=method_labels[m])
+    mae_imps = [r["mae_imp"] for r in plot_rows]
+    colors = ["#27ae60" if v >= 0 else "#e74c3c" for v in mae_imps]
+    ax2.bar(x, mae_imps, color=colors, alpha=0.7, width=0.8)
     ax2.axhline(y=0, color="black", linewidth=0.8)
     ax2.set_xticks(x[::max(1, len(x)//20)])
     ax2.set_xticklabels([d[5:] for d in dates[::max(1, len(x)//20)]], rotation=45)
     ax2.set_ylabel("MAE 提升 (%)")
-    ax2.set_title("每天 MAE 提升百分比")
-    ax2.legend(fontsize=8)
-    ax2.grid(alpha=0.3)
+    ax2.set_title(f"每天 MAE 提升 (EWMA α={args.ewma_alpha})")
+    ax2.grid(alpha=0.3, axis="y")
     fig2.tight_layout()
-    imp_path = os.path.join(HERE, "eval_random_improvement.png")
+    imp_path = os.path.join(HERE, "eval_ewma_improvement.png")
     fig2.savefig(imp_path, dpi=200, bbox_inches="tight")
     plt.close(fig2)
     print(f"提升图已保存: {imp_path}")

@@ -172,6 +172,25 @@ def compute_mape(y_true, y_pred, floor_ratio=0.05):
     return mape, n_total, n_used
 
 
+def sliding_window_correction(y_pred, residuals, window=168):
+    """滑动窗口残差修正 (方案一): 用最近 window 个残差的均值修正当前预测。
+
+    Args:
+        y_pred:     原始预测值 (1-D array)
+        residuals:  历史残差 true - pred (1-D array, 与 y_pred 等长)
+        window:     滑动窗口大小 (数据点数; 168 = 7天 × 24小时)
+
+    Returns:
+        corrected:  修正后的预测值 (1-D array)
+    """
+    corrected = y_pred.copy()
+    res = pd.Series(residuals)
+    rolling_mean = res.rolling(window=window, min_periods=1).mean().shift(1)
+    rolling_mean = rolling_mean.fillna(0.0).values
+    corrected = corrected + rolling_mean
+    return corrected
+
+
 # ==================== 自回归核心: 单步滚动 rollout ====================
 
 def autoregressive_rollout(model, src, future_exog, predict_steps,
@@ -690,6 +709,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         f.write(f"MAPE 过滤: 排除 |true| < {mape_floor:.0%} * max|true| 的点 "
                 f"(Train 保留 {train_metrics['mape_n_used']}/{train_metrics['mape_n_total']} 点, "
                 f"Test 保留 {test_metrics['mape_n_used']}/{test_metrics['mape_n_total']} 点)\n")
+        f.write(f"correction_window={cfg.get('correction_window', 0)}\n")
 
     # 画图 (仅测试集)
     y_true_test = test_metrics["y_true_inv"]
@@ -706,6 +726,105 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
 
         stat_by_start_time(y_true_test, y_pred_test, test_starts, result_dir,
                            floor_ratio=cfg.get("mape_floor_ratio", 0.05))
+
+    # ── 滑动窗口残差修正 (方案一): 去重 → 修正 → 对比 ──
+    correction_window = cfg.get("correction_window", 0)
+    correction_metrics = None
+    if correction_window > 0 and len(y_true_test) > 0 and test_starts is not None:
+        print(f"\n  滑动窗口残差修正 (window={correction_window} 数据点) ...")
+
+        # 重建每个预测点的时间戳
+        records = []
+        for i in range(len(y_true_test)):
+            base_time = test_starts[i]
+            for s in range(predict_steps):
+                ts = base_time + pd.Timedelta(minutes=(s + 1) * freq_minutes)
+                records.append({
+                    "sample_idx": i, "step": s, "timestamp": ts,
+                    "true": float(y_true_test[i, s, 0]),
+                    "pred": float(y_pred_test[i, s, 0]),
+                })
+        df_pred = pd.DataFrame(records)
+        df_pred = df_pred.sort_values(["timestamp", "sample_idx"])
+        df_unique = df_pred.drop_duplicates(subset="timestamp", keep="first").copy()
+        df_unique["residual"] = df_unique["true"] - df_unique["pred"]
+        df_unique = df_unique.sort_values("timestamp").reset_index(drop=True)
+
+        # 修正
+        pred_corrected = sliding_window_correction(
+            df_unique["pred"].values, df_unique["residual"].values,
+            window=correction_window)
+        df_unique["pred_corrected"] = pred_corrected
+        df_unique["residual_corrected"] = df_unique["true"] - pred_corrected
+
+        # 修正后指标
+        overall_corr = compute_mape(df_unique["true"].values, pred_corrected,
+                                    cfg.get("mape_floor_ratio", 0.05))
+        corr_mae = mean_absolute_error(df_unique["true"].values, pred_corrected)
+        corr_rmse = math.sqrt(mean_squared_error(df_unique["true"].values, pred_corrected))
+        corr_mape = overall_corr[0]
+        correction_metrics = {"mae": corr_mae, "rmse": corr_rmse, "mape": corr_mape}
+
+        # 对比打印
+        orig_mae = test_metrics["flow_mae"]
+        orig_rmse = test_metrics["flow_rmse"]
+        orig_mape = test_metrics["flow_mape"]
+        print(f"\n  {'='*60}")
+        print(f"  残差修正效果对比 (去重后 {len(df_unique)} 个时间点)")
+        print(f"  {'='*60}")
+        print(f"  {'指标':<10}{'原始':<14}{'修正后':<14}{'提升':<10}")
+        print(f"  {'MAE':<10}{orig_mae:<14.2f}{corr_mae:<14.2f}{(1-corr_mae/orig_mae)*100:+.2f}%")
+        print(f"  {'RMSE':<10}{orig_rmse:<14.2f}{corr_rmse:<14.2f}{(1-corr_rmse/orig_rmse)*100:+.2f}%")
+        print(f"  {'MAPE%':<10}{orig_mape:<14.2f}{corr_mape:<14.2f}{(1-corr_mape/orig_mape)*100:+.2f}%")
+
+        # 保存对比 CSV
+        df_unique.to_csv(os.path.join(result_dir, "predictions_comparison.csv"),
+                         index=False, float_format="%.4f")
+
+        # 画对比图
+        fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+        ts = df_unique["timestamp"]
+
+        ax1 = axes[0]
+        ax1.plot(ts, df_unique["true"], label="True", linewidth=0.8, alpha=0.8)
+        ax1.plot(ts, df_unique["pred"], label="Pred (original)", linewidth=0.8, alpha=0.8)
+        ax1.plot(ts, df_unique["pred_corrected"], label="Pred (corrected)",
+                 linewidth=0.8, alpha=0.8, color="green")
+        ax1.set_ylabel("Flow (m³/h)")
+        ax1.set_title(f"Test Set: True vs Pred (corrected window={correction_window})")
+        ax1.legend(); ax1.grid(alpha=0.3)
+
+        ax2 = axes[1]
+        ax2.plot(ts, df_unique["residual"], linewidth=0.6, alpha=0.7,
+                 color="steelblue", label="original")
+        ax2.plot(ts, df_unique["residual_corrected"], linewidth=0.6,
+                 alpha=0.7, color="green", label="corrected")
+        ax2.axhline(y=0, color="red", linestyle="--", linewidth=0.8, alpha=0.7)
+        ax2.set_ylabel("Residual (m³/h)")
+        ax2.set_title("Residual over Time (true - pred)")
+        ax2.legend(); ax2.grid(alpha=0.3)
+
+        ax3 = axes[2]
+        ax3.hist(df_unique["residual"], bins=80, alpha=0.5, color="steelblue",
+                 edgecolor="white", label="original")
+        ax3.hist(df_unique["residual_corrected"], bins=80, alpha=0.5, color="green",
+                 edgecolor="white", label="corrected")
+        ax3.axvline(x=0, color="red", linestyle="--", linewidth=0.8)
+        ax3.set_xlabel("Residual (m³/h)"); ax3.set_ylabel("Count")
+        ax3.set_title("Residual Distribution")
+        ax3.legend(); ax3.grid(alpha=0.3)
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(result_dir, "correction_comparison.png"),
+                    dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  对比图已保存: {os.path.join(result_dir, 'correction_comparison.png')}")
+        print(f"  对比数据已保存: {os.path.join(result_dir, 'predictions_comparison.csv')}")
+
+        # 追加修正指标到 metrics.txt
+        with open(os.path.join(result_dir, "metrics.txt"), "a", encoding="utf-8") as f:
+            f.write(f"修正后(window={correction_window}): "
+                    f"MAE={corr_mae:.2f}, RMSE={corr_rmse:.2f}, MAPE={corr_mape:.2f}%\n")
 
     # loss 曲线
     plt.figure(figsize=(10, 5))
@@ -740,6 +859,10 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         "test_rmse": test_metrics["flow_rmse"],
         "train_mape": train_metrics["flow_mape"],
         "test_mape": test_metrics["flow_mape"],
+        "correction_window": correction_window,
+        "test_mae_corrected": correction_metrics["mae"] if correction_metrics else None,
+        "test_rmse_corrected": correction_metrics["rmse"] if correction_metrics else None,
+        "test_mape_corrected": correction_metrics["mape"] if correction_metrics else None,
     }
 
 
@@ -759,6 +882,8 @@ def main():
     parser.add_argument("--detach-feedback", dest="detach_feedback",
                         action=argparse.BooleanOptionalAction, default=None,
                         help="回灌预测是否 detach (默认 True; --no-detach-feedback=完整BPTT)")
+    parser.add_argument("--correction_window", type=int, default=168,
+                        help="滑动窗口残差修正窗口大小 (数据点数, 默认 168=7天×24小时; 0=不修正)")
     args = parser.parse_args()
 
     config = dict(BASE_CONFIG)
@@ -770,6 +895,7 @@ def main():
         config["lookback_days"] = args.lookback
     if args.detach_feedback is not None:
         config["detach_feedback"] = args.detach_feedback
+    config["correction_window"] = args.correction_window
     set_seed(config["seed"])
 
     device = torch.device(config["device"])

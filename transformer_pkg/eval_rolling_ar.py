@@ -98,6 +98,25 @@ def autoregressive_predict(model, window_scaled, future_feat_scaled,
     return np.array(preds, dtype=np.float32)
 
 
+def sliding_window_correction(y_pred, residuals, window=168):
+    """滑动窗口残差修正 (方案一): 用最近 window 个残差的均值修正当前预测。
+
+    Args:
+        y_pred:     原始预测值 (1-D array)
+        residuals:  历史残差 true - pred (1-D array, 与 y_pred 等长)
+        window:     滑动窗口大小 (数据点数; 168 = 7天 × 24小时)
+
+    Returns:
+        corrected:  修正后的预测值 (1-D array)
+    """
+    corrected = y_pred.copy()
+    res = pd.Series(residuals)
+    rolling_mean = res.rolling(window=window, min_periods=1).mean().shift(1)
+    rolling_mean = rolling_mean.fillna(0.0).values
+    corrected = corrected + rolling_mean
+    return corrected
+
+
 def compute_metrics(y_true, y_pred, floor_ratio=0.1):
     """计算 MAE, RMSE, MAPE (过滤近零流量点)。"""
     y_true = np.asarray(y_true, dtype=float).flatten()
@@ -131,6 +150,8 @@ def main():
                         help="回看天数 (默认 7)")
     parser.add_argument("--out_dir", default=None,
                         help="输出目录 (默认与 result_dir 同级的 eval_rolling)")
+    parser.add_argument("--correction_window", type=int, default=168,
+                        help="滑动窗口残差修正窗口大小 (数据点数, 默认 168=7天×24小时; 0 表示不修正)")
     parser.add_argument("--encoding", default="utf-8-sig", help="CSV 编码")
     args = parser.parse_args()
 
@@ -306,12 +327,25 @@ def main():
     df_unique = df_detail.drop_duplicates(subset="timestamp", keep="first").copy()
     df_unique["residual"] = df_unique["true"] - df_unique["pred"]
     df_unique = df_unique.sort_values("timestamp").reset_index(drop=True)
+
+    # ── 方案一: 滑动窗口残差修正 ──
+    correction_window = args.correction_window
+    if correction_window > 0:
+        pred_corrected = sliding_window_correction(
+            df_unique["pred"].values, df_unique["residual"].values,
+            window=correction_window)
+        df_unique["pred_corrected"] = pred_corrected
+        df_unique["residual_corrected"] = df_unique["true"] - pred_corrected
+        print(f"滑动窗口残差修正已启用, 窗口大小 = {correction_window} 数据点")
+
     df_unique.to_csv(os.path.join(out_dir, "predictions_unique.csv"),
                      index=False, float_format="%.4f")
     print(f"\n去重后预测点数: {len(df_unique)} (原始 {len(df_detail)} 条)")
 
     # ── 残差随时间的分布图 ──
-    fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+    has_correction = "pred_corrected" in df_unique.columns
+    n_subplots = 4 if has_correction else 3
+    fig, axes = plt.subplots(n_subplots, 1, figsize=(16, 4 * n_subplots), sharex=True)
 
     ts = df_unique["timestamp"]
     residual = df_unique["residual"]
@@ -320,6 +354,9 @@ def main():
     ax1 = axes[0]
     ax1.plot(ts, df_unique["true"], label="True", linewidth=0.8, alpha=0.8)
     ax1.plot(ts, df_unique["pred"], label="Pred", linewidth=0.8, alpha=0.8)
+    if has_correction:
+        ax1.plot(ts, df_unique["pred_corrected"], label="Pred (corrected)",
+                 linewidth=0.8, alpha=0.8, color="green")
     ax1.set_ylabel("Flow (m³/h)")
     ax1.set_title("True vs Predicted (unique per timestamp)")
     ax1.legend()
@@ -327,10 +364,14 @@ def main():
 
     # 子图2: 残差时序
     ax2 = axes[1]
-    ax2.plot(ts, residual, linewidth=0.6, alpha=0.7, color="steelblue")
+    ax2.plot(ts, residual, linewidth=0.6, alpha=0.7, color="steelblue",
+             label="original")
     ax2.axhline(y=0, color="red", linestyle="--", linewidth=0.8, alpha=0.7)
     ax2.axhline(y=residual.mean(), color="orange", linestyle="--",
                 linewidth=0.8, alpha=0.7, label=f"mean={residual.mean():.2f}")
+    if has_correction:
+        ax2.plot(ts, df_unique["residual_corrected"], linewidth=0.6,
+                 alpha=0.7, color="green", label="corrected")
     ax2.set_ylabel("Residual (m³/h)")
     ax2.set_title("Residual over Time (true - pred)")
     ax2.legend()
@@ -338,15 +379,30 @@ def main():
 
     # 子图3: 残差分布直方图
     ax3 = axes[2]
-    ax3.hist(residual, bins=80, edgecolor="white", alpha=0.7, color="steelblue")
+    ax3.hist(residual, bins=80, edgecolor="white", alpha=0.5, color="steelblue",
+             label="original")
+    if has_correction:
+        ax3.hist(df_unique["residual_corrected"], bins=80, edgecolor="white",
+                 alpha=0.5, color="green", label="corrected")
     ax3.axvline(x=0, color="red", linestyle="--", linewidth=0.8)
     ax3.axvline(x=residual.mean(), color="orange", linestyle="--",
-                linewidth=0.8, label=f"mean={residual.mean():.2f}")
+                linewidth=0.8, alpha=0.7, label=f"mean={residual.mean():.2f}")
     ax3.set_xlabel("Residual (m³/h)")
     ax3.set_ylabel("Count")
     ax3.set_title("Residual Distribution")
     ax3.legend()
     ax3.grid(True, alpha=0.3)
+
+    # 子图4 (可选): 修正量随时间变化
+    if has_correction:
+        ax4 = axes[3]
+        correction_val = df_unique["pred_corrected"].values - df_unique["pred"].values
+        ax4.plot(ts, correction_val, linewidth=0.6, alpha=0.7, color="purple")
+        ax4.axhline(y=0, color="red", linestyle="--", linewidth=0.8, alpha=0.7)
+        ax4.set_ylabel("Correction (m³/h)")
+        ax4.set_xlabel("Date")
+        ax4.set_title(f"Sliding Window Correction (window={correction_window})")
+        ax4.grid(True, alpha=0.3)
 
     # x 轴日期格式
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
@@ -361,13 +417,28 @@ def main():
 
     # ── 打印结果 ──
     print(f"\n{'='*70}")
-    print(f" 整体评估结果")
+    print(f" 整体评估结果 (原始)")
     print(f"{'='*70}")
     print(f"  窗口数:   {len(all_preds)}")
     print(f"  预测点数: {overall['n_total']} (MAPE 使用 {overall['n_used']} 点)")
     print(f"  MAE:      {overall['mae']:.2f} m³/h")
     print(f"  RMSE:     {overall['rmse']:.2f} m³/h")
     print(f"  MAPE:     {overall['mape']:.2f}%")
+
+    if has_correction:
+        overall_corr = compute_metrics(
+            df_unique["true"].values, df_unique["pred_corrected"].values,
+            floor_ratio=0.1)
+        print(f"\n{'='*70}")
+        print(f" 整体评估结果 (滑动窗口残差修正, window={correction_window})")
+        print(f"{'='*70}")
+        print(f"  MAE:      {overall_corr['mae']:.2f} m³/h")
+        print(f"  RMSE:     {overall_corr['rmse']:.2f} m³/h")
+        print(f"  MAPE:     {overall_corr['mape']:.2f}%")
+        mae_imp = (1 - overall_corr["mae"] / overall["mae"]) * 100
+        rmse_imp = (1 - overall_corr["rmse"] / overall["rmse"]) * 100
+        print(f"  MAE 提升:  {mae_imp:+.2f}%")
+        print(f"  RMSE 提升: {rmse_imp:+.2f}%")
 
     print(f"\n{'='*70}")
     print(f" 按预测步长统计 (每小时)")
