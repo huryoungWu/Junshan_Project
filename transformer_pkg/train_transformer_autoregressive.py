@@ -21,7 +21,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from tqdm import tqdm
-
+import time
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 # ── 共享模块 (与 train_transformer.py 同目录, 不改动原文件) ──
@@ -72,7 +72,7 @@ BASE_CONFIG = {
 
     "lookback_days": 7,
     "predict_days": 1.0,
-    "label": "junshan_L1D_P24H_1h_itransformer_autoregressive_test",
+    "label": f"junshan_L1D_P24H_1h_transformer_autoregressive_{time.strftime('%Y%m%d_%H%M%S')}",
 
     "test_days": 30,
 
@@ -90,6 +90,10 @@ BASE_CONFIG = {
 
     # 自回归专用: 回灌的预测值是否 detach (True=稳定省显存, False=完整 BPTT)
     "detach_feedback": True,
+
+    # 峰值样本增强配置
+    "peak_augment_ratio": 0.3,      # 增强比例：增强后的峰值样本占总样本数的比例
+    "peak_threshold_ratio": 0.7,    # 峰值判定阈值：相对于训练集最大值的比例
 
     # 训练超参 (自回归 rollout 每步一次 forward, horizon=24 → 每 batch 24 次
     # forward; batch 降到 16 以控显存)
@@ -424,6 +428,66 @@ def make_sequences_ar(processor, x_array, y_array, lookback_days, predict_days):
     return X, Y, Xf
 
 
+def augment_peak_samples(X, Y, Xf, peak_threshold_ratio=0.7, peak_augment_ratio=0.3):
+    """峰值样本增强：对包含高峰时段的训练样本进行上采样。
+
+    原理：
+    - 检测每个样本的未来目标 Y 中是否存在峰值（最大值超过阈值）
+    - 峰值样本会被复制并添加到训练集中，提升模型对高峰时段的学习权重
+    - 避免模型倾向于预测"均值"而低估峰值
+
+    参数：
+    - X, Y, Xf: 原始训练序列
+    - peak_threshold_ratio: 峰值判定阈值（相对于整个训练集的最大值），默认0.7
+    - peak_augment_ratio: 增强比例（增强后的峰值样本数占总样本数的比例），默认0.3
+
+    返回：
+    - X_aug, Y_aug, Xf_aug: 增强后的序列
+    """
+    if len(X) == 0:
+        return X, Y, Xf
+
+    # 计算每个样本的最大值
+    sample_max = Y[:, :, 0].max(axis=1)  # 每个样本的最大流量值
+
+    # 确定峰值阈值
+    global_max = sample_max.max()
+    threshold = peak_threshold_ratio * global_max
+
+    # 找出峰值样本的索引
+    peak_indices = np.where(sample_max > threshold)[0]
+
+    if len(peak_indices) == 0:
+        print(f"  ⚠ 未找到峰值样本（阈值={threshold:.2f}），跳过增强")
+        return X, Y, Xf
+
+    # 计算需要增强的样本数
+    n_original = len(X)
+    n_target_aug = int(n_original * peak_augment_ratio)
+    n_to_add = max(0, n_target_aug - len(peak_indices))  # 只补充到目标数量
+
+    if n_to_add == 0:
+        # 峰值样本已足够，随机采样到目标数量
+        aug_indices = np.random.choice(peak_indices, n_target_aug, replace=True)
+    else:
+        # 峰值样本不足，需要重复采样
+        aug_indices = np.random.choice(peak_indices, n_target_aug, replace=True)
+
+    # 拼接原始数据和增强数据
+    X_aug = np.concatenate([X, X[aug_indices]], axis=0)
+    Y_aug = np.concatenate([Y, Y[aug_indices]], axis=0)
+    Xf_aug = np.concatenate([Xf, Xf[aug_indices]], axis=0)
+
+    print(f"  ✅ 峰值样本增强完成:")
+    print(f"     原始样本数: {n_original}")
+    print(f"     峰值样本数: {len(peak_indices)} (阈值={threshold:.2f})")
+    print(f"     新增样本数: {len(aug_indices)}")
+    print(f"     增强后总样本数: {len(X_aug)}")
+    print(f"     峰值占比: {len(peak_indices)/n_original*100:.1f}% -> {min(1.0, (len(peak_indices)+len(aug_indices))/len(X_aug))*100:.1f}%")
+
+    return X_aug, Y_aug, Xf_aug
+
+
 # ==================== 单次实验运行 ====================
 
 def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, processor, device, test_index=None):
@@ -449,6 +513,16 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     # 构建序列 (额外返回未来外生特征行 X_future)
     X_train, Y_train, Xf_train = make_sequences_ar(processor, x_train_all, y_train_all, lookback, predict)
     X_test, Y_test, Xf_test = make_sequences_ar(processor, x_test_all, y_test_all, lookback, predict)
+
+    # 峰值样本增强（仅对训练集）
+    peak_augment_ratio = cfg.get("peak_augment_ratio", 0.3)
+    peak_threshold_ratio = cfg.get("peak_threshold_ratio", 0.7)
+    if peak_augment_ratio > 0 and len(X_train) > 0:
+        X_train, Y_train, Xf_train = augment_peak_samples(
+            X_train, Y_train, Xf_train,
+            peak_threshold_ratio=peak_threshold_ratio,
+            peak_augment_ratio=peak_augment_ratio
+        )
 
     freq_minutes = int(cfg["resample_freq"].replace("min", ""))
     points_per_day = (24 * 60) // freq_minutes
@@ -549,19 +623,20 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
             "flow_mape": test_metrics["flow_mape"], "lr": lr_now
         })
 
-        # 更新 epoch 进度条后缀, 显示关键指标
-        epoch_pbar.set_postfix(
-            train_loss=f"{train_loss:.6f}",
-            test_loss=f"{test_loss:.6f}",
-            MAPE=f"{test_metrics['flow_mape']:.2f}%",
-            lr=f"{lr_now:.6f}"
-        )
-
+        # 更新 epoch 进度条后缀, 显示关键指标 (MAPE 显示最优值)
         current_mape = test_metrics["flow_mape"]
         if current_mape < best_test_mape:
             best_test_mape = current_mape
             best_state = deepcopy(model.state_dict())
             torch.save(best_state, os.path.join(result_dir, "best_seq2seq_model.pth"))
+
+        epoch_pbar.set_postfix(
+            train_loss=f"{train_loss:.6f}",
+            test_loss=f"{test_loss:.6f}",
+            best_MAPE=f"{best_test_mape:.2f}%",
+            cur_MAPE=f"{current_mape:.2f}%",
+            lr=f"{lr_now:.6f}"
+        )
 
         if early_stopper.step(current_mape):
             print(f"\n  Early stopping at epoch={epoch}")

@@ -18,6 +18,11 @@ import math
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from transformer_model import TimeSeriesTransformer
@@ -196,7 +201,10 @@ def main():
     all_trues = []     # (n_windows, predict_steps)
     window_dates = []  # 每个窗口预测的起始日期
 
-    for start in range(min_start, max_start):
+    pbar = tqdm(range(min_start, max_start),
+                desc="滚动预测", unit="win",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}")
+    for start in pbar:
         # 回看窗口
         window = data_scaled[start - lookback_steps:start]
         window_t = torch.from_numpy(window).unsqueeze(0).to(device)
@@ -206,6 +214,10 @@ def main():
         if len(future_idx) < predict_steps:
             break
         future_dates = future_idx
+
+        # 更新进度条显示当前预测日期
+        current_date = df_feat.index[start].strftime("%Y-%m-%d %H:%M")
+        pbar.set_postfix_str(f"当前: {current_date}")
 
         # 未来特征: 从原始数据取 (已缩放), 目标通道会被预测覆盖
         future_raw = df_feat.iloc[start:start + predict_steps][feature_cols].values.copy()
@@ -227,6 +239,7 @@ def main():
         all_preds.append(pred_inv)
         all_trues.append(true_inv)
         window_dates.append(df_feat.index[start])
+    pbar.close()
 
     all_preds = np.array(all_preds)  # (n_windows, predict_steps)
     all_trues = np.array(all_trues)
@@ -287,6 +300,65 @@ def main():
     df_detail.to_csv(os.path.join(out_dir, "predictions.csv"),
                      index=False, float_format="%.4f")
 
+    # ── 每个时间点只保留一个预测值 (取 step 最小 = 最近窗口的预测) ──
+    df_detail["timestamp"] = pd.to_datetime(df_detail["timestamp"])
+    df_detail = df_detail.sort_values(["timestamp", "step"])
+    df_unique = df_detail.drop_duplicates(subset="timestamp", keep="first").copy()
+    df_unique["residual"] = df_unique["true"] - df_unique["pred"]
+    df_unique = df_unique.sort_values("timestamp").reset_index(drop=True)
+    df_unique.to_csv(os.path.join(out_dir, "predictions_unique.csv"),
+                     index=False, float_format="%.4f")
+    print(f"\n去重后预测点数: {len(df_unique)} (原始 {len(df_detail)} 条)")
+
+    # ── 残差随时间的分布图 ──
+    fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+
+    ts = df_unique["timestamp"]
+    residual = df_unique["residual"]
+
+    # 子图1: 真实值 vs 预测值
+    ax1 = axes[0]
+    ax1.plot(ts, df_unique["true"], label="True", linewidth=0.8, alpha=0.8)
+    ax1.plot(ts, df_unique["pred"], label="Pred", linewidth=0.8, alpha=0.8)
+    ax1.set_ylabel("Flow (m³/h)")
+    ax1.set_title("True vs Predicted (unique per timestamp)")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # 子图2: 残差时序
+    ax2 = axes[1]
+    ax2.plot(ts, residual, linewidth=0.6, alpha=0.7, color="steelblue")
+    ax2.axhline(y=0, color="red", linestyle="--", linewidth=0.8, alpha=0.7)
+    ax2.axhline(y=residual.mean(), color="orange", linestyle="--",
+                linewidth=0.8, alpha=0.7, label=f"mean={residual.mean():.2f}")
+    ax2.set_ylabel("Residual (m³/h)")
+    ax2.set_title("Residual over Time (true - pred)")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    # 子图3: 残差分布直方图
+    ax3 = axes[2]
+    ax3.hist(residual, bins=80, edgecolor="white", alpha=0.7, color="steelblue")
+    ax3.axvline(x=0, color="red", linestyle="--", linewidth=0.8)
+    ax3.axvline(x=residual.mean(), color="orange", linestyle="--",
+                linewidth=0.8, label=f"mean={residual.mean():.2f}")
+    ax3.set_xlabel("Residual (m³/h)")
+    ax3.set_ylabel("Count")
+    ax3.set_title("Residual Distribution")
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    # x 轴日期格式
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    ax2.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO))
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    plot_path = os.path.join(out_dir, "residual_over_time.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"残差分布图已保存: {plot_path}")
+
     # ── 打印结果 ──
     print(f"\n{'='*70}")
     print(f" 整体评估结果")
@@ -305,9 +377,11 @@ def main():
         print(f"  {int(r['step']):<8}{r['mae']:<12.2f}{r['rmse']:<12.2f}{r['mape']:<10.2f}")
 
     print(f"\n结果已保存到: {out_dir}")
-    print(f"  window_metrics.csv  — 逐窗口指标")
-    print(f"  step_metrics.csv    — 按预测步长指标")
-    print(f"  predictions.csv     — 所有预测值与真实值")
+    print(f"  window_metrics.csv      — 逐窗口指标")
+    print(f"  step_metrics.csv        — 按预测步长指标")
+    print(f"  predictions.csv         — 所有预测值与真实值")
+    print(f"  predictions_unique.csv  — 每时间点一个预测值 (最近窗口)")
+    print(f"  residual_over_time.png  — 残差随时间分布图")
 
 
 if __name__ == "__main__":
