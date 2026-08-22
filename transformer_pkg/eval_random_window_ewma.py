@@ -3,7 +3,7 @@
 用法:
   python eval_random_window_ewma.py --start_date 2025-10-01
   python eval_random_window_ewma.py --start_date 2025-01-08 --all_days
-  python eval_random_window_ewma.py --start_date 2025-01-08 --all_days --ewma_alpha 0.15
+  python eval_random_window_ewma.py --start_date 2025-01-08 --all_days --ewma_alpha 0.20
   python eval_random_window_ewma.py --start_date 2025-01-08 --all_days --ewma_alpha 0.0
   python eval_random_window_ewma.py --seed 42
 """
@@ -102,8 +102,8 @@ def main():
                         help="评估起始日期 (格式 YYYY-MM-DD, 第一个预测日)")
     parser.add_argument("--seed", type=int, default=None,
                         help="随机种子 (仅未指定 --start_date 时生效)")
-    parser.add_argument("--ewma_alpha", type=float, default=0.2,
-                        help="EWMA 衰减因子 (默认 0.2)")
+    parser.add_argument("--ewma_alpha", type=float, default=0.70,
+                        help="EWMA 衰减因子 (默认 0.70, 最优值)")
     parser.add_argument("--all_days", action="store_true",
                         help="从 start_date 到数据末尾逐日预测")
     parser.add_argument("--encoding", default="utf-8-sig", help="CSV 编码")
