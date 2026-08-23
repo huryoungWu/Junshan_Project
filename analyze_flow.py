@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
+plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ============ 1. 数据加载 ============

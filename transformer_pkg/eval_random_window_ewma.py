@@ -37,7 +37,7 @@ from data_processing import DataProcessor
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA = r"D:\Junshan_Project\data\水厂2025年小时级汇总.csv"
 DEFAULT_RESULT_DIR = os.path.join(HERE, "results",
-                                  "junshan_L1D_P24H_1h_itransformer_autoregressive_test")
+                                  "junshan_L1D_P24H_1h_transformer_autoregressive_20260823_100748")
 
 
 def correct_day_ewma(pred_day, true_day, ewma_state):

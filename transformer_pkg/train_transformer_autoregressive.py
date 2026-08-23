@@ -65,7 +65,7 @@ BASE_CONFIG = {
     "file_path": r"D:\Junshan_Project\data\水厂2025年小时级汇总.csv",
     "encoding": "utf-8-sig",
     "resample_freq": "60min",
-    "stride": 6,
+    "stride": 24,
     "hampel_cols": ["Total_Flow"],   # 仅清洗流量 (压力/泵量测不再读取)
     "hampel_window": 48,
     "spike_ratio": 2.0,
@@ -172,22 +172,22 @@ def compute_mape(y_true, y_pred, floor_ratio=0.05):
     return mape, n_total, n_used
 
 
-def sliding_window_correction(y_pred, residuals, window=168):
-    """滑动窗口残差修正 (方案一): 用最近 window 个残差的均值修正当前预测。
+def ewma_correction(y_pred, residuals, alpha=0.70):
+    """EWMA 残差修正: r̂_t = α·r_{t-1} + (1-α)·r̂_{t-1}
 
     Args:
         y_pred:     原始预测值 (1-D array)
         residuals:  历史残差 true - pred (1-D array, 与 y_pred 等长)
-        window:     滑动窗口大小 (数据点数; 168 = 7天 × 24小时)
+        alpha:      EWMA 衰减因子 (默认 0.70, 经搜索最优值)
 
     Returns:
         corrected:  修正后的预测值 (1-D array)
     """
-    corrected = y_pred.copy()
-    res = pd.Series(residuals)
-    rolling_mean = res.rolling(window=window, min_periods=1).mean().shift(1)
-    rolling_mean = rolling_mean.fillna(0.0).values
-    corrected = corrected + rolling_mean
+    corrected = np.zeros_like(y_pred, dtype=float)
+    ewma_val = 0.0
+    for i in range(len(y_pred)):
+        corrected[i] = y_pred[i] + ewma_val
+        ewma_val = alpha * residuals[i] + (1 - alpha) * ewma_val
     return corrected
 
 
@@ -709,7 +709,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         f.write(f"MAPE 过滤: 排除 |true| < {mape_floor:.0%} * max|true| 的点 "
                 f"(Train 保留 {train_metrics['mape_n_used']}/{train_metrics['mape_n_total']} 点, "
                 f"Test 保留 {test_metrics['mape_n_used']}/{test_metrics['mape_n_total']} 点)\n")
-        f.write(f"correction_window={cfg.get('correction_window', 0)}\n")
+        f.write(f"ewma_alpha={cfg.get('ewma_alpha', 0)}\n")
 
     # 画图 (仅测试集)
     y_true_test = test_metrics["y_true_inv"]
@@ -727,11 +727,11 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         stat_by_start_time(y_true_test, y_pred_test, test_starts, result_dir,
                            floor_ratio=cfg.get("mape_floor_ratio", 0.05))
 
-    # ── 滑动窗口残差修正 (方案一): 去重 → 修正 → 对比 ──
-    correction_window = cfg.get("correction_window", 0)
+    # ── EWMA 残差修正: 去重 → 逐小时修正 → 对比 ──
+    ewma_alpha = cfg.get("ewma_alpha", 0.0)
     correction_metrics = None
-    if correction_window > 0 and len(y_true_test) > 0 and test_starts is not None:
-        print(f"\n  滑动窗口残差修正 (window={correction_window} 数据点) ...")
+    if ewma_alpha > 0 and len(y_true_test) > 0 and test_starts is not None:
+        print(f"\n  EWMA 残差修正 (alpha={ewma_alpha}) ...")
 
         # 重建每个预测点的时间戳
         records = []
@@ -750,10 +750,10 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         df_unique["residual"] = df_unique["true"] - df_unique["pred"]
         df_unique = df_unique.sort_values("timestamp").reset_index(drop=True)
 
-        # 修正
-        pred_corrected = sliding_window_correction(
+        # EWMA 修正
+        pred_corrected = ewma_correction(
             df_unique["pred"].values, df_unique["residual"].values,
-            window=correction_window)
+            alpha=ewma_alpha)
         df_unique["pred_corrected"] = pred_corrected
         df_unique["residual_corrected"] = df_unique["true"] - pred_corrected
 
@@ -791,7 +791,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         ax1.plot(ts, df_unique["pred_corrected"], label="Pred (corrected)",
                  linewidth=0.8, alpha=0.8, color="green")
         ax1.set_ylabel("Flow (m³/h)")
-        ax1.set_title(f"Test Set: True vs Pred (corrected window={correction_window})")
+        ax1.set_title(f"Test Set: True vs Pred (EWMA alpha={ewma_alpha})")
         ax1.legend(); ax1.grid(alpha=0.3)
 
         ax2 = axes[1]
@@ -823,7 +823,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
 
         # 追加修正指标到 metrics.txt
         with open(os.path.join(result_dir, "metrics.txt"), "a", encoding="utf-8") as f:
-            f.write(f"修正后(window={correction_window}): "
+            f.write(f"EWMA修正(alpha={ewma_alpha}): "
                     f"MAE={corr_mae:.2f}, RMSE={corr_rmse:.2f}, MAPE={corr_mape:.2f}%\n")
 
     # loss 曲线
@@ -859,7 +859,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         "test_rmse": test_metrics["flow_rmse"],
         "train_mape": train_metrics["flow_mape"],
         "test_mape": test_metrics["flow_mape"],
-        "correction_window": correction_window,
+        "ewma_alpha": ewma_alpha,
         "test_mae_corrected": correction_metrics["mae"] if correction_metrics else None,
         "test_rmse_corrected": correction_metrics["rmse"] if correction_metrics else None,
         "test_mape_corrected": correction_metrics["mape"] if correction_metrics else None,
@@ -882,8 +882,8 @@ def main():
     parser.add_argument("--detach-feedback", dest="detach_feedback",
                         action=argparse.BooleanOptionalAction, default=None,
                         help="回灌预测是否 detach (默认 True; --no-detach-feedback=完整BPTT)")
-    parser.add_argument("--correction_window", type=int, default=168,
-                        help="滑动窗口残差修正窗口大小 (数据点数, 默认 168=7天×24小时; 0=不修正)")
+    parser.add_argument("--ewma_alpha", type=float, default=0.70,
+                        help="EWMA 残差修正衰减因子 (默认 0.70, 最优值; 0=不修正)")
     args = parser.parse_args()
 
     config = dict(BASE_CONFIG)
@@ -895,7 +895,7 @@ def main():
         config["lookback_days"] = args.lookback
     if args.detach_feedback is not None:
         config["detach_feedback"] = args.detach_feedback
-    config["correction_window"] = args.correction_window
+    config["ewma_alpha"] = args.ewma_alpha
     set_seed(config["seed"])
 
     device = torch.device(config["device"])
