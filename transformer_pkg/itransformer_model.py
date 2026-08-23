@@ -12,7 +12,8 @@ import torch.nn as nn
 #   iTransformer 反过来——把"每个变量的一条序列"当 token, 对变量做 attention,
 #   时间依赖交给逐变量的 MLP 嵌入 (Linear(L → d_model)), 预测时每变量独立出整个
 #   horizon。本项目输入是 5 维特征 (流量 + 日历特征 hour_sin/hour_cos/
-#   dayofweek/is_weekend), 5 个变量 token 做跨变量 attention —— 注意单通道
+#   dow_sin/cos, month_sin/cos, doy_sin/cos, is_workday, is_holiday, holiday_eve/next),
+#   12 个变量 token 做跨变量 attention —— 注意单通道
 #   (C=1) 时 attention 退化为恒等, 整个 encoder 只剩逐 token MLP, 无意义。
 #
 # 接口与 TimeSeriesTransformer 完全一致 (src, target_len, tgt, teacher_forcing_ratio),

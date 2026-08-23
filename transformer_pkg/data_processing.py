@@ -5,6 +5,13 @@ from torch.utils.data import Dataset
 
 from sklearn.preprocessing import StandardScaler
 
+try:
+    from chinese_calendar import is_holiday, is_workday as _cal_is_workday
+    _HAS_CHINESE_CALENDAR = True
+except ImportError:
+    _HAS_CHINESE_CALENDAR = False
+    print("⚠ chinese-calendar 未安装, 节假日特征退化为简单周末判断 (pip install chinese-calendar)")
+
 # ============================================================================
 # data_processing.py — 军山水厂数据清洗 / 训练测试集划分 (共用管线, 仅流量)
 #
@@ -25,7 +32,8 @@ from sklearn.preprocessing import StandardScaler
 #      (在 Hampel 之前执行, 命中整点以插值值保留)
 #   2. Hampel 离群清洗 (窗口 2 天整点) + 流量物理界限裁剪 (0~10000)
 #   3. 重采样 (60min, 已是整点 → 恒等) + 删除空 bin (空洞不虚构)
-#   4. 模型输入 = Total_Flow + 日历特征 (hour_sin/cos, dayofweek, is_weekend,
+#   4. 模型输入 = Total_Flow + 日历特征 (hour_sin/cos, dow_sin/cos, is_workday,
+#      month_sin/cos, doy_sin/cos, is_holiday, holiday_eve, holiday_next,
 #      由时间索引确定性生成, 见 CALENDAR_COLS / add_calendar_features;
 #      压力 / 泵量测仍不读不算)
 #   5. 按时间划分训练/测试集 (split_by_time) 与归一化 (scaler 由训练端拟合并保存)
@@ -41,10 +49,48 @@ HAMPEL_K          = 10.0    # 遂值: |x - 局部中位数| > k * scale 判为�
 MAD_FLOOR_RATIO   = 0.02    # scale 下限 = 局部中位数的 2% (防 MAD≈0 误报)
 
 # ==================== 日历特征 (训练/推理共用, 由时间索引确定性生成) ====================
-# 小时相位 sin/cos 双通道 (24h 周期, 平滑 23→0 跨越) + 星期几 + 周末标记。
-# 水厂流量有强日周期与周模式 (工作日/周末差异), 显式给模型省去从流量里硬猜时刻。
+# 多尺度周期编码 + 中国法定节假日感知:
+#   hour_sin/cos   : 24h 日周期 (平滑 23→0 跨越)
+#   dow_sin/cos    : 7 天周周期 (替代原 dayofweek 数值, 保留 6→0 平滑过渡)
+#   month_sin/cos  : 12 月季节周期 (捕捉夏高冬低的用水季节性)
+#   doy_sin/cos    : 年日序号周期 (更细粒度的季节过渡, 如梅雨/伏天)
+#   is_workday     : 调休感知的工作日 (chinese_calendar 区分补班/调休)
+#   is_holiday     : 法定假日 (含调休安排的连假, 如春节/国庆)
+#   holiday_eve    : 假期前一天 (节前工厂赶工 / 居民囤水, 用水模式提前变化)
+#   holiday_next   : 假期后一天 (节后恢复过渡期)
 # 由时刻唯一确定: 训练/推理/未来 rollout 同源生成, 值精确可知, 不需模型预测。
-CALENDAR_COLS = ["hour_sin", "hour_cos", "dayofweek", "is_weekend"]
+# 依赖 chinese-calendar 包 (pip install chinese-calendar), 未安装时退化为简单周末。
+CALENDAR_COLS = [
+    "hour_sin", "hour_cos",
+    "dow_sin", "dow_cos",
+    "month_sin", "month_cos",
+    "doy_sin", "doy_cos",
+    "is_workday", "is_holiday", "holiday_eve", "holiday_next",
+]
+
+# ==================== 数据驱动特征 (从流量时序统计提取) ====================
+# 基于 Part1/Part2 图表揭示的规律设计:
+#   滞后:   昨天/上周同时段流量 (日内形状日间重复)
+#   滚动:   多尺度均值/标准差 (近似 Part1 多项式拟合趋势)
+#   日内:   当天峰谷幅度/早晚高峰比例 (Part2 曲线形状描述符)
+#   偏离:   Z-score (当前值相对近期水平的偏离程度)
+#
+# 所有特征用 shift() 避免未来信息泄露, 训练/推理口径一致。
+# 新增 / 修改后必须重新训练 (旧 scaler.pkl 的 feature_cols 校验不匹配)。
+DATA_DRIVEN_COLS = [
+    # 滞后特征
+    "lag_24h", "lag_168h", "lag_24h_diff", "lag_24h_ratio",
+    # 滚动统计
+    "roll_mean_3d", "roll_mean_7d", "roll_mean_30d",
+    "roll_std_7d", "roll_max_7d", "roll_min_7d", "roll_median_48h",
+    # 日内形状 (shift 1 天, 用前一天完整日内统计, 避免当天前瞻)
+    "day_avg", "day_peak_amp", "morning_ratio", "evening_ratio", "night_ratio",
+    # 偏离特征
+    "flow_zscore_7d", "flow_zscore_30d",
+]
+
+# 旧版日历特征 (兼容旧模型: hour_sin/cos, dayofweek, is_weekend)
+LEGACY_CALENDAR_COLS = ["hour_sin", "hour_cos", "dayofweek", "is_weekend"]
 
 
 def needed_csv_columns(header):
@@ -86,25 +132,188 @@ class DataProcessor:
         self.target_cols = ["Total_Flow"]
         self.feature_cols = None
 
-    def add_calendar_features(self, df):
+    def add_calendar_features(self, df, use_legacy=False):
         """给带 DatetimeIndex 的 df 追加日历特征列 (返回新 df, 不修改入参)。
 
-        列 (见 CALENDAR_COLS):
-          hour_sin / hour_cos : 小时相位 sin/cos 编码 (24h 周期, 平滑 23→0 跨越)
-          dayofweek           : 星期几 0(周一)~6(周日)
-          is_weekend          : 是否周末 (0/1)
+        Args:
+            df: 带 DatetimeIndex 的 DataFrame
+            use_legacy: True 时生成旧版 4 特征 (hour_sin/cos, dayofweek, is_weekend),
+                        用于兼容旧模型; False (默认) 生成新版 12 特征。
+
+        新版列 (见 CALENDAR_COLS):
+          hour_sin / hour_cos   : 小时相位 sin/cos (24h 周期)
+          dow_sin / dow_cos     : 星期几 sin/cos (7 天周期, 6→0 平滑)
+          month_sin / month_cos : 月份 sin/cos (12 月季节周期)
+          doy_sin / doy_cos     : 年日序号 sin/cos (365 天细粒度季节)
+          is_workday            : 调休感知工作日 (chinese_calendar; 未装则=is_weekend)
+          is_holiday            : 法定假日 (含调休连假; 未装则=0)
+          holiday_eve           : 假期前一天 (未装则=0)
+          holiday_next          : 假期后一天 (未装则=0)
+
+        旧版列 (legacy):
+          hour_sin / hour_cos : 同上
+          dayofweek           : 星期几 0~6 (数值)
+          is_weekend          : 是否周末 0/1
 
         日历特征由时刻唯一确定: 训练 / 推理 / 未来 rollout 都用同一份代码生成,
         口径一致; 未来时刻的值精确可知, 自回归 rollout 中作为外生通道用真值,
         不需要模型预测。改动特征集合后必须重新训练 (见模块头注释)。
         """
         out = df.copy()
+
+        # ── 小时 sin/cos (24h 周期, 新旧共用) ──
         h = out.index.hour.to_numpy()
         out["hour_sin"] = np.sin(2.0 * np.pi * h / 24.0).astype(np.float32)
         out["hour_cos"] = np.cos(2.0 * np.pi * h / 24.0).astype(np.float32)
+
+        if use_legacy:
+            # 旧版: dayofweek 数值 + is_weekend
+            dow = out.index.dayofweek.to_numpy()
+            out["dayofweek"] = dow.astype(np.float32)
+            out["is_weekend"] = (dow >= 5).astype(np.float32)
+            return out
+
+        # ── 以下为新版特征 ──
+
+        # ── 星期几 sin/cos (7 天周期, 替代原 dayofweek 数值) ──
         dow = out.index.dayofweek.to_numpy()
-        out["dayofweek"] = dow.astype(np.float32)
-        out["is_weekend"] = (dow >= 5).astype(np.float32)
+        out["dow_sin"] = np.sin(2.0 * np.pi * dow / 7.0).astype(np.float32)
+        out["dow_cos"] = np.cos(2.0 * np.pi * dow / 7.0).astype(np.float32)
+
+        # ── 月份 sin/cos (12 月季节周期) ──
+        month = out.index.month.to_numpy()
+        out["month_sin"] = np.sin(2.0 * np.pi * month / 12.0).astype(np.float32)
+        out["month_cos"] = np.cos(2.0 * np.pi * month / 12.0).astype(np.float32)
+
+        # ── 年日序号 sin/cos (365 天细粒度季节过渡) ──
+        doy = out.index.dayofyear.to_numpy()
+        out["doy_sin"] = np.sin(2.0 * np.pi * doy / 365.25).astype(np.float32)
+        out["doy_cos"] = np.cos(2.0 * np.pi * doy / 365.25).astype(np.float32)
+
+        # ── 工作日 / 节假日特征 (依赖 chinese_calendar) ──
+        dates = out.index.normalize()   # 当天 00:00:00 (去重后用于批量查询)
+        unique_dates = dates.unique()
+
+        if _HAS_CHINESE_CALENDAR:
+            # 批量查询: 每个日期只查一次, 再 map 回逐行
+            workday_map = {d: float(_cal_is_workday(d.to_pydatetime().date()))
+                          for d in unique_dates}
+            # is_holiday 包含普通周末; 只标记法定假日 (非工作日且非周末)
+            holiday_map = {}
+            for d in unique_dates:
+                dt = d.to_pydatetime().date()
+                # 法定假日 = 非工作日 且 不是普通周末 (周六/周日)
+                is_special = (not _cal_is_workday(dt)) and d.dayofweek < 5
+                holiday_map[d] = float(is_special)
+
+            # holiday_eve / holiday_next: 前后一天是否是法定假日
+            eve_map = {}
+            next_map = {}
+            for d in unique_dates:
+                prev_d = d - pd.Timedelta(days=1)
+                next_d = d + pd.Timedelta(days=1)
+                # 超出 chinese-calendar 覆盖范围的日期, 用周末近似
+                try:
+                    prev_dt = prev_d.to_pydatetime().date()
+                    eve_map[d] = float(not _cal_is_workday(prev_dt) and prev_d.dayofweek < 5)
+                except ValueError:
+                    eve_map[d] = 0.0
+                try:
+                    next_dt = next_d.to_pydatetime().date()
+                    next_map[d] = float(not _cal_is_workday(next_dt) and next_d.dayofweek < 5)
+                except ValueError:
+                    next_map[d] = 0.0
+
+            out["is_workday"] = dates.map(workday_map).astype(np.float32)
+            out["is_holiday"] = dates.map(holiday_map).astype(np.float32)
+            out["holiday_eve"] = dates.map(eve_map).astype(np.float32)
+            out["holiday_next"] = dates.map(next_map).astype(np.float32)
+        else:
+            # 无 chinese-calendar 时退化: 用 dayofweek 近似
+            is_weekend = (dow >= 5).astype(np.float32)
+            out["is_workday"] = 1.0 - is_weekend
+            out["is_holiday"] = np.float32(0.0)
+            out["holiday_eve"] = np.float32(0.0)
+            out["holiday_next"] = np.float32(0.0)
+
+        return out
+
+    def add_data_driven_features(self, df):
+        """基于流量时序统计的特征, 捕捉图表中可见的季节/日内模式。
+
+        在 add_calendar_features() 之后调用, 依赖 Total_Flow 列。
+        所有特征用 shift() 避免未来信息泄露:
+          - 滚动/偏离特征: shift(1) 确保只用当前时刻之前的数据
+          - 日内形状特征: shift(24) 用前一天完整日内统计, 避免当天前瞻
+
+        Args:
+            df: 带 DatetimeIndex 的 DataFrame, 含 Total_Flow + 日历特征
+
+        Returns:
+            追加数据驱动特征后的 DataFrame (不修改入参)
+        """
+        out = df.copy()
+        flow = out["Total_Flow"]
+
+        # ── 1. 滞后特征: 昨天/上周同时段 (Part2: 日内形状日间高度重复) ──
+        out["lag_24h"] = flow.shift(24).astype(np.float32)
+        out["lag_168h"] = flow.shift(168).astype(np.float32)
+        out["lag_24h_diff"] = (flow - flow.shift(24)).astype(np.float32)
+        out["lag_24h_ratio"] = (flow / flow.shift(24).replace(0, np.nan)).astype(np.float32)
+
+        # ── 2. 滚动统计: 多尺度趋势 (Part1: 多项式拟合的离散近似) ──
+        # shift(1): 严格用当前时刻之前的数据, 避免信息泄露
+        flow_shifted = flow.shift(1)
+
+        out["roll_mean_3d"] = flow_shifted.rolling(72, min_periods=36).mean().astype(np.float32)
+        out["roll_mean_7d"] = flow_shifted.rolling(168, min_periods=84).mean().astype(np.float32)
+        out["roll_mean_30d"] = flow_shifted.rolling(720, min_periods=360).mean().astype(np.float32)
+        out["roll_std_7d"] = flow_shifted.rolling(168, min_periods=84).std().astype(np.float32)
+        out["roll_max_7d"] = flow_shifted.rolling(168, min_periods=84).max().astype(np.float32)
+        out["roll_min_7d"] = flow_shifted.rolling(168, min_periods=84).min().astype(np.float32)
+        out["roll_median_48h"] = flow_shifted.rolling(48, min_periods=24).median().astype(np.float32)
+
+        # ── 3. 日内形状特征: 用前一天完整日内统计 (shift 24h) ──
+        # Part2 显示日内曲线形状稳定但幅度随季节变化
+        day_groups = flow.groupby(flow.index.normalize())
+        daily_stats = day_groups.agg(
+            day_avg="mean",
+            day_max="max",
+            day_min="min",
+        )
+        daily_stats["day_peak_amp"] = daily_stats["day_max"] - daily_stats["day_min"]
+
+        # 早晚高峰均值
+        h = flow.index.hour
+        morning_mask = (h >= 7) & (h <= 10)
+        evening_mask = (h >= 18) & (h <= 21)
+        night_mask = (h >= 0) & (h <= 5)
+        day_dates = flow.index.normalize()
+        daily_stats["morning_avg"] = flow.where(morning_mask).groupby(day_dates).mean()
+        daily_stats["evening_avg"] = flow.where(evening_mask).groupby(day_dates).mean()
+        daily_stats["night_avg"] = flow.where(night_mask).groupby(day_dates).mean()
+
+        # 高峰比例 = 高峰均值 / 全天均值
+        daily_stats["morning_ratio"] = (daily_stats["morning_avg"] / daily_stats["day_avg"].replace(0, np.nan))
+        daily_stats["evening_ratio"] = (daily_stats["evening_avg"] / daily_stats["day_avg"].replace(0, np.nan))
+        daily_stats["night_ratio"] = (daily_stats["night_avg"] / daily_stats["day_avg"].replace(0, np.nan))
+
+        # 只保留需要的列, shift 1 天避免当天前瞻
+        day_feats = daily_stats[["day_avg", "day_peak_amp", "morning_ratio",
+                                 "evening_ratio", "night_ratio"]].shift(1)
+
+        # 映射回小时级
+        for col in day_feats.columns:
+            out[col] = day_dates.map(day_feats[col]).astype(np.float32)
+
+        # ── 4. 偏离特征: 当前值相对近期水平 (Part1: 拟合残差的统计描述) ──
+        r7_mean = out["roll_mean_7d"]
+        r7_std = out["roll_std_7d"].replace(0, np.nan)
+        out["flow_zscore_7d"] = ((flow - r7_mean) / r7_std).astype(np.float32)
+
+        r30_std = flow_shifted.rolling(720, min_periods=360).std().replace(0, np.nan)
+        out["flow_zscore_30d"] = ((flow - out["roll_mean_30d"]) / r30_std).astype(np.float32)
+
         return out
 
     def load_raw(self):
@@ -279,9 +488,18 @@ class DataProcessor:
         df_clean = pd.concat([self.clean_and_resample(df_base_train),
                               self.clean_and_resample(df_base_test)])
 
-        # 日历特征: 由时间索引确定性生成, 训练/推理共用同一方法 (无压力/泵量测)。
+        # 日历特征 + 数据驱动特征: 由时间索引 + 历史流量确定性生成, 训练/推理共用。
         df_feat = self.add_calendar_features(df_clean)
-        self.feature_cols = ["Total_Flow"] + list(CALENDAR_COLS)
+        df_feat = self.add_data_driven_features(df_feat)
+        self.feature_cols = ["Total_Flow"] + list(CALENDAR_COLS) + list(DATA_DRIVEN_COLS)
+
+        # 丢弃特征 NaN 行 (主要来自 30 天滚动窗口, 约前 720 行)
+        n_before = len(df_feat)
+        df_feat = df_feat.dropna(subset=self.feature_cols)
+        n_dropped = n_before - len(df_feat)
+        if n_dropped > 0:
+            print(f"  丢弃特征 NaN 行: {n_dropped} 条 ({n_dropped/n_before:.1%}), 剩 {len(df_feat)}")
+
         return df_feat
 
     def split_by_time(self, df):
