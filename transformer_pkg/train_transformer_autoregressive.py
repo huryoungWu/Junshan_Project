@@ -66,10 +66,11 @@ BASE_CONFIG = {
     "file_path": r"D:\Junshan_Project\data\水厂2025年小时级汇总.csv",
     "encoding": "utf-8-sig",
     "resample_freq": "60min",
-    "stride": 24,
+    "stride": 6,
     "hampel_cols": ["Total_Flow"],   # 仅清洗流量 (压力/泵量测不再读取)
     "hampel_window": 48,
-    "spike_ratio": 1.2,
+    "spike_ratio_within": 1.2,   # 日内 t±1h 突变阈值 (曲线平滑, 阈值可低)
+    "spike_ratio_cross": 1.5,    # 跨日 t±24h 突变阈值 (日间差异大, 需更高阈值)
 
     "lookback_days": 7,
     "predict_days": 1.0,

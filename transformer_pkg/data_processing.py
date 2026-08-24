@@ -406,10 +406,9 @@ class DataProcessor:
         在 Hampel / 物理裁剪之前执行: 规则命中的突变整点直接插值修正, 保留该
         小时参与训练; 修正后残余的极端离群仍由 Hampel 置 NaN 删除, 两者互补。
 
-        两种突变判据 (任一命中即修正, k = config['spike_ratio'], 默认 2.0):
-          日内: t 时刻与 t±1h 比较 —— 8 点流量比 7 点、9 点都突然高 (或低) → 异常
-          跨日: t 时刻与昨天/明天同一整点比较 —— 3/31 8 点比 3/30、4/1 8 点都
-                突然低 (或高) → 异常
+        两种突变判据 (任一命中即修正), 各自独立阈值:
+          日内 (k_within, 默认 1.2): t 时刻与 t±1h 比较, 曲线平滑可用低阈值
+          跨日 (k_cross, 默认 2.0):  t 时刻与 t±24h 比较, 日间差异大需高阈值
         "突然"的定义: 流量 > k × max(两参考点) (高突变) 或 < min(两参考点) / k
         (低突变), 即比两个参考点都显著偏离才判异常 —— 正常日周期/泵切换的
         平滑阶跃不满足条件 (阶跃后至少一个参考点在新水平上, 不满足"都偏离")。
@@ -424,7 +423,11 @@ class DataProcessor:
         if "Total_Flow" not in res.columns:
             return res
         freq_minutes = int(self.config["resample_freq"].replace("min", ""))
-        k = self.config.get("spike_ratio", 2.0)
+        # 日内/跨日分别设阈值: 日内曲线平滑可用低阈值, 跨日日间差异大需高阈值
+        k_within = self.config.get("spike_ratio_within",
+                                   self.config.get("spike_ratio", 1.2))
+        k_cross = self.config.get("spike_ratio_cross",
+                                   self.config.get("spike_ratio", 2.0))
         within_steps = max(1, 60 // freq_minutes)      # 1h 折算步数
         day_steps = (24 * 60) // freq_minutes          # 1 天折算步数
         within_delta = pd.Timedelta(minutes=freq_minutes * within_steps)
@@ -444,7 +447,7 @@ class DataProcessor:
         n1, n2 = f.shift(within_steps), f.shift(-within_steps)   # 日内参考: t±1h
         p1, p2 = f.shift(day_steps), f.shift(-day_steps)         # 跨日参考: t±1 天
 
-        def flags(cur, r1, r2, ok1, ok2):
+        def flags(cur, r1, r2, ok1, ok2, k):
             ref_hi = pd.concat([r1, r2], axis=1).max(axis=1)
             ref_lo = pd.concat([r1, r2], axis=1).min(axis=1)
             hi = (cur > k * ref_hi) & (ref_hi > 0)
@@ -452,8 +455,8 @@ class DataProcessor:
             # ok 含时间间隔校验; 参考点 NaN (被 Hampel 等置空) 时 ref 为 NaN → 判据不命中
             return (hi | lo) & ok1 & ok2 & r1.notna() & r2.notna()
 
-        within_anom = flags(f, n1, n2, n1_ok, n2_ok)       # 判据1: 日内 t±1h
-        day_anom = flags(f, p1, p2, p1_ok, p2_ok)          # 判据2: 跨日 t±1 天
+        within_anom = flags(f, n1, n2, n1_ok, n2_ok, k_within)  # 判据1: 日内 t±1h
+        day_anom = flags(f, p1, p2, p1_ok, p2_ok, k_cross)     # 判据2: 跨日 t±1 天
         anomaly = within_anom | day_anom
         if not anomaly.any():
             return res
@@ -467,7 +470,8 @@ class DataProcessor:
         res.loc[anomaly, "Total_Flow"] = fix
 
         print(f"  突变流量插值修正: {n_anom} 条 ({n_anom / len(res):.3%}) "
-              f"[日内 {int(within_anom.sum())} / 跨日 {int((day_anom & ~within_anom).sum())}]")
+              f"[日内 k={k_within} {int(within_anom.sum())} / "
+              f"跨日 k={k_cross} {int((day_anom & ~within_anom).sum())}]")
         for t in anomaly[anomaly].index[:5]:
             print(f"    {t}  {orig[t]:9.1f} → {fix[t]:9.1f}")
         return res
