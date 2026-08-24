@@ -1,13 +1,10 @@
-"""指定窗口评估: 选择起始日期, 逐日预测, 调用外部 EWMA 修正模块对比修正前后指标。
+"""指定窗口评估: 选择起始日期, 逐日预测, 输出原始预测指标。
 
 用法:
   # 单天模式
   python eval_random_window.py --start_date 2025-10-01
 
   # 全天模式
-  python eval_random_window.py --start_date 2025-01-08 --all_days
-
-  # 指定 EWMA alpha
   python eval_random_window.py --start_date 2025-01-08 --all_days
 """
 
@@ -36,10 +33,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from transformer_model import TimeSeriesTransformer
 from itransformer_model import iTransformer
 from data_processing import DataProcessor
-
-# 导入外部 EWMA 修正模块
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from ewma_correction import run_ewma_correction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA = r"D:\Junshan_Project\data\水厂2025年小时级汇总.csv"
@@ -83,7 +76,7 @@ def calc_metrics(y_true, y_pred):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="指定窗口评估: 逐日预测 + 外部 EWMA 修正对比")
+        description="指定窗口评估: 逐日预测, 输出原始指标")
     parser.add_argument("--data", default=DEFAULT_DATA, help="原始数据 CSV")
     parser.add_argument("--result_dir", default=DEFAULT_RESULT_DIR, help="训练结果目录")
     parser.add_argument("--lookback", type=int, default=7, help="回看天数 (默认 7)")
@@ -254,206 +247,47 @@ def main():
     orig_mae, orig_rmse, orig_mape = calc_metrics(all_true, all_orig)
 
     print(f"\n{'='*70}")
-    print(f" 原始预测指标 ({n_actual} 天)")
+    print(f" 预测指标 ({n_actual} 天)")
     print(f"{'='*70}")
     print(f"  MAE={orig_mae:.2f}, RMSE={orig_rmse:.2f}, MAPE={orig_mape:.2f}%")
 
-    # ── 导出 CSV 供外部 EWMA 模块使用 ──
-    ewma_work_dir = os.path.join(args.result_dir, "_ewma_work")
-    os.makedirs(ewma_work_dir, exist_ok=True)
-    pred_csv = os.path.join(ewma_work_dir, "predictions.csv")
-    true_csv = os.path.join(ewma_work_dir, "true_values.csv")
-    warmup_csv = os.path.join(ewma_work_dir, "warmup_predictions.csv")
-    state_csv = os.path.join(ewma_work_dir, "ewma_state.csv")
-    corrected_csv = os.path.join(ewma_work_dir, "corrected_predictions.csv")
-
-    SITE_ID = "junshan"
-
-    # 构建 predictions.csv: site_id, date, predicted_value (每小时一行)
-    pred_rows = []
-    true_rows = []
+    # ── 逐日指标 ──
+    print(f"\n{'='*70}")
+    print(f" 逐日指标")
+    print(f"{'='*70}")
+    print(f"  {'日期':<14}{'MAE':<10}{'RMSE':<10}{'MAPE%':<10}")
+    print(f"  {'-'*44}")
     for day in range(n_actual):
-        for h in range(predict_steps):
-            ts = all_day_timestamps[day][h]
-            pred_rows.append({
-                "site_id": SITE_ID,
-                "date": ts,
-                "predicted_value": float(all_day_preds[day][h]),
-            })
-            true_rows.append({
-                "site_id": SITE_ID,
-                "date": ts,
-                "true_value": float(all_day_trues[day][h]),
-            })
+        d_mae, d_rmse, d_mape = calc_metrics(all_day_trues[day], all_day_preds[day])
+        date_str = all_day_timestamps[day][0].strftime("%Y-%m-%d")
+        print(f"  {date_str:<14}{d_mae:<10.2f}{d_rmse:<10.2f}{d_mape:<10.2f}")
 
-    # 追加预热期的真实值到 true_rows (供 EWMA 预热阶段匹配)
-    warmup_start_idx = first_pred_idx - lookback * points_per_day
-    if warmup_start_idx >= 0:
-        for wi in range(warmup_start_idx, first_pred_idx):
-            ts = df_feat.index[wi]
-            true_val = float(target_scaler.inverse_transform(
-                data_scaled[wi, 0].reshape(-1, 1)).flatten()[0])
-            true_rows.append({
-                "site_id": SITE_ID,
-                "date": ts,
-                "true_value": true_val,
-            })
+    # ── 画预测对比图 ──
+    plt.rcParams["font.sans-serif"] = ["SimHei"]
+    plt.rcParams["axes.unicode_minus"] = False
 
-    df_pred_out = pd.DataFrame(pred_rows)
-    df_true_out = pd.DataFrame(true_rows)
-    df_pred_out.to_csv(pred_csv, index=False)
-    df_true_out.to_csv(true_csv, index=False)
-    print(f"\n预测数据已导出: {pred_csv} ({len(df_pred_out)} 条)")
-    print(f"真实值已导出: {true_csv} ({len(df_true_out)} 条)")
+    fig, axes = plt.subplots(min(n_actual, 5), 1,
+                             figsize=(14, 3 * min(n_actual, 5)),
+                             sharex=False)
+    if n_actual == 1:
+        axes = [axes]
 
-    # ── 生成预热数据: 用模型对预测期之前的历史窗口做预测 ──
-    warmup_days = lookback  # 用前 lookback 天作为预热
-    warmup_start = first_pred_idx - warmup_days * points_per_day
-    if warmup_start >= 0:
-        print(f"\n生成预热数据: {warmup_days} 天 ({df_feat.index[warmup_start].date()} ~ "
-              f"{df_feat.index[first_pred_idx - 1].date()})")
-        warmup_rows = []
-        for wday in range(warmup_days):
-            w_pred_start = warmup_start + wday * points_per_day
-            w_pred_end = w_pred_start + predict_steps
-            if w_pred_end > first_pred_idx:  # 不超过预测期起点
-                break
-            w_lb_start = w_pred_start - lookback_steps
-            if w_lb_start < 0:
-                continue
+    for i, ax in enumerate(axes):
+        if i >= n_actual:
+            break
+        ts = all_day_timestamps[i]
+        ax.plot(ts, all_day_trues[i], "b-o", markersize=2, label="真实值")
+        ax.plot(ts, all_day_preds[i], "r-s", markersize=2, label="预测值")
+        ax.set_title(f"Day {i+1}: {ts[0].strftime('%Y-%m-%d')}")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
 
-            window_scaled = data_scaled[w_lb_start:w_pred_start]
-            window_t = torch.from_numpy(window_scaled).unsqueeze(0).to(device)
-            future_raw = df_feat.iloc[w_pred_start:w_pred_end][feature_cols].values.copy()
-            future_scaled = feature_scaler.transform(future_raw.astype(np.float32))
-
-            w_pred_scaled = autoregressive_predict(
-                model, window_t, future_scaled, predict_steps,
-                target_feat_idx, device)
-            w_pred_inv = target_scaler.inverse_transform(
-                w_pred_scaled.reshape(-1, 1)).flatten()
-
-            for h in range(predict_steps):
-                ts = df_feat.index[w_pred_start + h]
-                warmup_rows.append({
-                    "site_id": SITE_ID,
-                    "date": ts,
-                    "predicted_value": float(w_pred_inv[h]),
-                })
-
-        df_warmup = pd.DataFrame(warmup_rows)
-        df_warmup.to_csv(warmup_csv, index=False)
-        print(f"预热数据已导出: {warmup_csv} ({len(df_warmup)} 条)")
-    else:
-        warmup_csv = None
-        print("  ⚠ 数据不足, 跳过预热")
-
-    # ── Alpha 扫描: 0.0 ~ 1.0 步长 0.1 ──
-    alpha_list = [round(i * 0.1, 1) for i in range(11)]  # [0.0, 0.1, ..., 1.0]
-    sweep_results = []
-
-    print(f"\n{'='*70}")
-    print(f" Alpha 扫描 (0.0 ~ 1.0, 步长 0.1)")
-    print(f"{'='*70}")
-
-    for alpha in alpha_list:
-        # 每个 alpha 用独立的状态/结果文件
-        state_alpha = os.path.join(ewma_work_dir, f"ewma_state_a{alpha}.csv")
-        corrected_alpha = os.path.join(ewma_work_dir, f"corrected_a{alpha}.csv")
-
-        for f in (state_alpha, corrected_alpha):
-            if os.path.exists(f):
-                os.remove(f)
-
-        run_ewma_correction(
-            predictions_path=pred_csv,
-            true_values_path=true_csv,
-            state_path=state_alpha,
-            output_path=corrected_alpha,
-            alpha_default=alpha,
-            target_date=None,
-            warmup_path=warmup_csv,
-        )
-
-        if not os.path.exists(corrected_alpha):
-            print(f"  alpha={alpha}: 修正失败, 跳过")
-            continue
-
-        df_corr = pd.read_csv(corrected_alpha)
-        df_corr["date"] = pd.to_datetime(df_corr["date"])
-        corr_map = dict(zip(df_corr["date"], df_corr["corrected_prediction"]))
-
-        all_corr = np.array([corr_map.get(ts, orig)
-                             for ts, orig in zip(
-                                 pd.to_datetime(df_pred_out["date"]),
-                                 all_orig)])
-        c_mae, c_rmse, c_mape = calc_metrics(all_true, all_corr)
-        mae_imp = (1 - c_mae / orig_mae) * 100 if orig_mae > 0 else 0
-        rmse_imp = (1 - c_rmse / orig_rmse) * 100 if orig_rmse > 0 else 0
-        mape_imp = (1 - c_mape / orig_mape) * 100 if orig_mape > 0 else 0
-
-        sweep_results.append({
-            "alpha": alpha, "mae": c_mae, "rmse": c_rmse, "mape": c_mape,
-            "mae_imp": mae_imp, "rmse_imp": rmse_imp, "mape_imp": mape_imp,
-        })
-        print(f"  alpha={alpha:.1f}: MAE={c_mae:.2f} ({mae_imp:+.2f}%), "
-              f"RMSE={c_rmse:.2f} ({rmse_imp:+.2f}%), MAPE={c_mape:.2f}% ({mape_imp:+.2f}%)")
-
-    # ── 汇总表 ──
-    print(f"\n{'='*70}")
-    print(f" Alpha 扫描汇总 ({n_actual} 天, {len(all_true)} 个时间点)")
-    print(f"{'='*70}")
-    print(f"  {'alpha':<8}{'MAE':<12}{'MAE提升':<12}{'RMSE':<12}{'RMSE提升':<12}{'MAPE%':<12}{'MAPE提升':<12}")
-    print(f"  {'-'*80}")
-    print(f"  {'(无修正)':<8}{orig_mae:<12.2f}{'---':<12}{orig_rmse:<12.2f}{'---':<12}{orig_mape:<12.2f}{'---':<12}")
-    for r in sweep_results:
-        print(f"  {r['alpha']:<8.1f}{r['mae']:<12.2f}{r['mae_imp']:>+10.2f}%"
-              f"{r['rmse']:<12.2f}{r['rmse_imp']:>+10.2f}%"
-              f"{r['mape']:<12.2f}{r['mape_imp']:>+10.2f}%")
-
-    # 找最优 alpha
-    if sweep_results:
-        best = max(sweep_results, key=lambda r: r["mae_imp"])
-        print(f"\n  最优 alpha={best['alpha']:.1f}: "
-              f"MAE={best['mae']:.2f} ({best['mae_imp']:+.2f}%), "
-              f"RMSE={best['rmse']:.2f} ({best['rmse_imp']:+.2f}%), "
-              f"MAPE={best['mape']:.2f}% ({best['mape_imp']:+.2f}%)")
-
-    # ── 保存扫描结果 CSV ──
-    sweep_df = pd.DataFrame(sweep_results)
-    sweep_csv = os.path.join(HERE, "eval_alpha_sweep.csv")
-    sweep_df.to_csv(sweep_csv, index=False, float_format="%.4f")
-    print(f"\nAlpha 扫描结果已保存: {sweep_csv}")
-
-    # ── 画 Alpha 扫描对比图 ──
-    if sweep_results:
-        plt.rcParams["font.sans-serif"] = ["SimHei"]
-        plt.rcParams["axes.unicode_minus"] = False
-
-        alphas = [r["alpha"] for r in sweep_results]
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-        for ax, metric, label in zip(axes, ["mae", "rmse", "mape"], ["MAE", "RMSE", "MAPE%"]):
-            vals = [r[metric] for r in sweep_results]
-            orig_val = orig_mae if metric == "mae" else orig_rmse if metric == "rmse" else orig_mape
-            ax.plot(alphas, vals, "o-", color="#2c3e50", linewidth=1.5, markersize=6, label="EWMA修正")
-            ax.axhline(y=orig_val, color="#e74c3c", linestyle="--", linewidth=1, label=f"原始({orig_val:.2f})")
-            ax.set_xlabel("Alpha")
-            ax.set_ylabel(label)
-            ax.set_title(f"{label} vs Alpha")
-            ax.legend(fontsize=9)
-            ax.grid(alpha=0.3)
-            ax.set_xticks(alphas)
-
-        fig.suptitle(f"EWMA Alpha 扫描 ({n_actual}天)", fontsize=14)
-        fig.tight_layout()
-        sweep_fig_path = os.path.join(HERE, "eval_alpha_sweep.png")
-        fig.savefig(sweep_fig_path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-        print(f"Alpha 扫描图已保存: {sweep_fig_path}")
-
-    # 清理临时文件
-    print(f"\n临时文件保留在: {ewma_work_dir}")
+    fig.suptitle(f"逐日预测对比 ({n_actual}天, MAPE={orig_mape:.2f}%)", fontsize=13)
+    fig.tight_layout()
+    fig_path = os.path.join(HERE, "eval_random_window.png")
+    fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n预测对比图已保存: {fig_path}")
 
 
 if __name__ == "__main__":
