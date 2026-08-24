@@ -28,7 +28,6 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from transformer_model import TimeSeriesTransformer
 from itransformer_model import iTransformer
 from data_processing import DataProcessor
-from transformer_variants import get_variant_class, VARIANT_REGISTRY
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # ============================================================================
@@ -67,10 +66,10 @@ BASE_CONFIG = {
     "file_path": r"D:\Junshan_Project\data\水厂2025年小时级汇总.csv",
     "encoding": "utf-8-sig",
     "resample_freq": "60min",
-    "stride": 6,
+    "stride": 24,
     "hampel_cols": ["Total_Flow"],   # 仅清洗流量 (压力/泵量测不再读取)
     "hampel_window": 48,
-    "spike_ratio": 1.5,
+    "spike_ratio": 1.75,
 
     "lookback_days": 7,
     "predict_days": 1.0,
@@ -159,15 +158,6 @@ def weighted_mse_loss(pred, target, flow_weight=1.0):
     return flow_weight * flow_loss
 
 
-def smooth_mse_loss(pred, target, smooth_lambda=0.05):
-    """MSE + 一阶差分平滑惩罚 (优化方案⑤)"""
-    mse = ((pred[:, :, 0] - target[:, :, 0]) ** 2).mean()
-    # 差分平滑: 鼓励相邻预测点变化平缓
-    diff_pred = pred[:, 1:, 0] - pred[:, :-1, 0]
-    smooth_loss = (diff_pred ** 2).mean()
-    return mse + smooth_lambda * smooth_loss
-
-
 def compute_mape(y_true, y_pred, floor_ratio=0.05):
     y_true = np.asarray(y_true, dtype=float).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
@@ -186,8 +176,7 @@ def compute_mape(y_true, y_pred, floor_ratio=0.05):
 # ==================== 自回归核心: 单步滚动 rollout ====================
 
 def autoregressive_rollout(model, src, future_exog, predict_steps,
-                           target_feat_idx, detach_feedback=True,
-                           scheduled_sampling_rate=None):
+                           target_feat_idx, detach_feedback=True):
     """单步自回归 rollout: 把上一轮预测回灌为输入, 滚动预测 predict_steps 个点。
 
     输入:
@@ -198,8 +187,6 @@ def autoregressive_rollout(model, src, future_exog, predict_steps,
       target_feat_idx: 目标通道在 C 维的下标 (Total_Flow 在 feature_cols 中的位置)
       detach_feedback: True → 回灌预测值 detach, 梯度只训练当前步 (省显存, 稳定);
                        False → 完整 BPTT, 梯度穿过整条 rollout 链
-      scheduled_sampling_rate: float [0,1] or None. 若非 None, 以该概率使用 ground-truth
-                               作为下一步目标通道 (优化方案⑦: 计划采样, 缓解 exposure bias)
     输出:
       preds : (B, H, 1) 预测序列 (target 域, 与 target_scaler 一致)
     """
@@ -214,14 +201,6 @@ def autoregressive_rollout(model, src, future_exog, predict_steps,
         if detach_feedback:
             feedback = feedback.detach()
         next_row = future_exog[:, k:k + 1, :].clone()  # (B, 1, C)
-
-        # ⑦ 计划采样: 以 scheduled_sampling_rate 概率用 ground-truth 替换预测值
-        if scheduled_sampling_rate is not None and scheduled_sampling_rate > 0:
-            use_teacher = torch.rand(src.size(0), device=src.device) < scheduled_sampling_rate
-            gt_feedback = future_exog[:, k:k+1, 0:1].squeeze(1).squeeze(1)  # (B,)
-            # 对 use_teacher=True 的样本用 ground-truth, 否用模型预测
-            feedback = torch.where(use_teacher, gt_feedback, feedback)
-
         next_row[:, 0, target_feat_idx] = feedback      # 覆盖目标通道
 
         # 滑窗: 丢最旧一行, 末尾拼上 next_row
@@ -233,7 +212,7 @@ def autoregressive_rollout(model, src, future_exog, predict_steps,
 # ==================== 评估 ====================
 
 def evaluate(model, loader, device, processor, predict_steps,
-             target_feat_idx, detach_feedback, scheduled_sampling_rate=None):
+             target_feat_idx, detach_feedback):
     model.eval()
     total_loss = 0.0
     all_preds, all_trues = [], []
@@ -245,8 +224,7 @@ def evaluate(model, loader, device, processor, predict_steps,
             batch_y = batch_y.to(device)
             batch_xf = batch_xf.to(device)
             pred = autoregressive_rollout(model, batch_x, batch_xf, predict_steps,
-                                          target_feat_idx, detach_feedback,
-                                          scheduled_sampling_rate=scheduled_sampling_rate)
+                                          target_feat_idx, detach_feedback)
             loss = weighted_mse_loss(pred, batch_y)
             total_loss += loss.item() * len(batch_x)
             all_preds.append(pred.cpu().numpy())
@@ -596,11 +574,6 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
             **common_model_kwargs,
             target_idx=target_feat_idx,
         ).to(device)
-    elif model_type.startswith("variant_"):
-        variant_name = model_type.replace("variant_", "")
-        variant_cls, _, _ = get_variant_class(variant_name)
-        model = variant_cls(**common_model_kwargs).to(device)
-        print(f"  使用优化变体: {variant_name} ({variant_cls.__name__})")
     else:
         model = TimeSeriesTransformer(**common_model_kwargs).to(device)
 
@@ -613,28 +586,12 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     best_test_mape = float("inf")
     history = []
 
-    # ── ⑦ 计划采样: 训练时逐步降低 teacher forcing 概率 ──
-    use_scheduled_sampling = cfg.get("custom_scheduled_sampling", False)
-    ss_decay_epochs = cfg.get("epochs", 40)  # 整个训练周期内从 1.0 衰减到 0.0
-
-    # ── ⑤ 平滑损失 ──
-    use_smooth_loss = cfg.get("custom_smooth_loss", False)
-    smooth_lambda = cfg.get("smooth_lambda", 0.05)
-
-    if use_scheduled_sampling:
-        print(f"  [⑦ 计划采样] 启用: 从 1.0 线性衰减至 0.0 (共 {ss_decay_epochs} epoch)")
-    if use_smooth_loss:
-        print(f"  [⑤ 平滑损失] 启用: MSE + λ={smooth_lambda} * diff_smooth")
-
     print(f"\n  Training(自回归): {label}")
 
     epoch_pbar = tqdm(range(1, cfg["epochs"] + 1), desc="Epochs", unit="epoch")
     for epoch in epoch_pbar:
         model.train()
         train_loss_sum = 0.0
-
-        # ⑦ 计划采样: 训练时的 teacher forcing 概率 (线性衰减)
-        ss_rate = max(0.0, 1.0 - epoch / ss_decay_epochs) if use_scheduled_sampling else None
 
         batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg['epochs']}",
                           unit="batch", leave=False)
@@ -645,13 +602,8 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
 
             # 单步自回归 rollout: 把上一轮预测回灌为输入, 滚动 predict_steps 步
             pred = autoregressive_rollout(model, batch_x, batch_xf, predict_steps,
-                                         target_feat_idx, detach_feedback,
-                                         scheduled_sampling_rate=ss_rate)
-            # ⑤ ⑥ 损失函数选择
-            if use_smooth_loss:
-                loss = smooth_mse_loss(pred, batch_y, smooth_lambda=smooth_lambda)
-            else:
-                loss = weighted_mse_loss(pred, batch_y)
+                                         target_feat_idx, detach_feedback)
+            loss = weighted_mse_loss(pred, batch_y)
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -660,9 +612,8 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
             batch_pbar.set_postfix(loss=f"{loss.item():.6f}")
 
         train_loss = train_loss_sum / len(train_loader.dataset)
-        # 评估时不用 scheduled sampling (始终用 ground truth)
         test_metrics = evaluate(model, test_loader, device, processor, predict_steps,
-                                target_feat_idx, detach_feedback, scheduled_sampling_rate=None)
+                                target_feat_idx, detach_feedback)
         test_loss = test_metrics["loss"]
         scheduler.step()
         lr_now = optimizer.param_groups[0]["lr"]
@@ -716,11 +667,11 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     print(f"  ⚠ 注意: 本模型为单步自回归, 推理须用配套的 autoregressive_rollout "
           f"(见 train_transformer_autoregressive.py), 不能用原直接多步推理脚本")
 
-    # 最终评估 (评估时不用 scheduled sampling)
+    # 最终评估
     train_metrics = evaluate(model, train_loader, device, processor, predict_steps,
-                             target_feat_idx, detach_feedback, scheduled_sampling_rate=None)
+                             target_feat_idx, detach_feedback)
     test_metrics = evaluate(model, test_loader, device, processor, predict_steps,
-                            target_feat_idx, detach_feedback, scheduled_sampling_rate=None)
+                            target_feat_idx, detach_feedback)
 
     print(f"\n  最终结果:")
     print(f"  Train: Loss={train_metrics['loss']:.6f}, MAE={train_metrics['flow_mae']:.2f}, "
@@ -809,9 +760,6 @@ def main():
     parser.add_argument("--detach-feedback", dest="detach_feedback",
                         action=argparse.BooleanOptionalAction, default=None,
                         help="回灌预测是否 detach (默认 True; --no-detach-feedback=完整BPTT)")
-    parser.add_argument("--variant", default=None,
-                        choices=list(VARIANT_REGISTRY.keys()),
-                        help="模型优化变体: attnpool/conv/gelu/multiscale/smooth_loss/scheduled_sampling")
     args = parser.parse_args()
 
     config = dict(BASE_CONFIG)
@@ -823,16 +771,6 @@ def main():
         config["lookback_days"] = args.lookback
     if args.detach_feedback is not None:
         config["detach_feedback"] = args.detach_feedback
-    if args.variant is not None:
-        config["variant"] = args.variant
-        # 根据 variant 设置对应标志
-        model_cls, needs_custom_loss, needs_custom_rollout = get_variant_class(args.variant)
-        config["custom_smooth_loss"] = needs_custom_loss
-        config["custom_scheduled_sampling"] = needs_custom_rollout
-        if model_cls is not None:
-            config["model_type"] = f"variant_{args.variant}"
-        # 更新 label 以区分不同变体
-        config["label"] = f"junshan_L1D_P24H_1h_ar_{args.variant}_{time.strftime('%Y%m%d_%H%M%S')}"
     set_seed(config["seed"])
 
     device = torch.device(config["device"])
