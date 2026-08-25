@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import time
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -66,7 +67,7 @@ BASE_CONFIG = {
     "file_path": r"D:\Junshan_Project\data\水厂2025年小时级汇总.csv",
     "encoding": "utf-8-sig",
     "resample_freq": "60min",
-    "stride": 6,
+    "stride": 1,
     "hampel_cols": ["Total_Flow"],   # 仅清洗流量 (压力/泵量测不再读取)
     "hampel_window": 48,
     "spike_ratio_within": 1.2,   # 日内 t±1h 突变阈值 (曲线平滑, 阈值可低)
@@ -108,6 +109,8 @@ BASE_CONFIG = {
 
     "T_0": 30,
     "T_mult": 2,
+
+    "eval_interval": 2,  # 每隔N个epoch评估一次测试集 (加速训练)
 
     "seed": 42,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -551,9 +554,11 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         return None
 
     train_loader = DataLoader(ARSeqDataset(X_train, Y_train, Xf_train),
-                              batch_size=cfg["batch_size"], shuffle=True)
+                              batch_size=cfg["batch_size"], shuffle=True,
+                              pin_memory=True, num_workers=2)
     test_loader = DataLoader(ARSeqDataset(X_test, Y_test, Xf_test),
-                            batch_size=cfg["batch_size"], shuffle=False)
+                            batch_size=cfg["batch_size"], shuffle=False,
+                            pin_memory=True, num_workers=2)
 
     # ── 模型工厂: horizon=1 (单步头), 自回归 rollout 负责滚出 horizon ──
     model_type = cfg.get("model_type", "transformer")
@@ -578,6 +583,16 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     else:
         model = TimeSeriesTransformer(**common_model_kwargs).to(device)
 
+    # torch.compile: JIT编译加速 (需要 PyTorch >= 2.1)
+    if hasattr(torch, "compile") and tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 1):
+        try:
+            model = torch.compile(model)
+            print("  torch.compile enabled")
+        except Exception as e:
+            print(f"  torch.compile failed ({e}), using eager mode")
+    else:
+        print(f"  torch.compile skipped (PyTorch {torch.__version__} < 2.1)")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["learning_rate"],
                                  weight_decay=cfg["weight_decay"])
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=cfg["T_0"], T_mult=cfg["T_mult"])
@@ -586,8 +601,15 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     best_state = None
     best_test_mape = float("inf")
     history = []
+    test_metrics = {}  # 防止首次跳过评估时未定义
+
+    # AMP: 混合精度训练加速
+    use_amp = device.type == "cuda"
+    scaler = GradScaler(enabled=use_amp)
+    eval_interval = cfg.get("eval_interval", 1)
 
     print(f"\n  Training(自回归): {label}")
+    print(f"  AMP={'ON' if use_amp else 'OFF'}, eval_interval={eval_interval}")
 
     epoch_pbar = tqdm(range(1, cfg["epochs"] + 1), desc="Epochs", unit="epoch")
     for epoch in epoch_pbar:
@@ -597,47 +619,63 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg['epochs']}",
                           unit="batch", leave=False)
         for batch_x, batch_y, batch_xf in batch_pbar:
-            batch_x = batch_x.to(device)
-            batch_y = batch_y.to(device)
-            batch_xf = batch_xf.to(device)
+            batch_x = batch_x.to(device, non_blocking=True)
+            batch_y = batch_y.to(device, non_blocking=True)
+            batch_xf = batch_xf.to(device, non_blocking=True)
 
-            # 单步自回归 rollout: 把上一轮预测回灌为输入, 滚动 predict_steps 步
-            pred = autoregressive_rollout(model, batch_x, batch_xf, predict_steps,
-                                         target_feat_idx, detach_feedback)
-            loss = weighted_mse_loss(pred, batch_y)
-            optimizer.zero_grad()
-            loss.backward()
+            optimizer.zero_grad(set_to_none=True)
+
+            # AMP: forward 用 float16, backward 用 float16 + 缩放
+            with autocast(enabled=use_amp):
+                pred = autoregressive_rollout(model, batch_x, batch_xf, predict_steps,
+                                             target_feat_idx, detach_feedback)
+                loss = weighted_mse_loss(pred, batch_y)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
+
             train_loss_sum += loss.item() * len(batch_x)
             batch_pbar.set_postfix(loss=f"{loss.item():.6f}")
 
         train_loss = train_loss_sum / len(train_loader.dataset)
-        test_metrics = evaluate(model, test_loader, device, processor, predict_steps,
-                                target_feat_idx, detach_feedback)
-        test_loss = test_metrics["loss"]
+
+        # 按 eval_interval 频率评估测试集
+        do_eval = (epoch % eval_interval == 0) or (epoch == cfg["epochs"])
+        if do_eval:
+            test_metrics = evaluate(model, test_loader, device, processor, predict_steps,
+                                    target_feat_idx, detach_feedback)
+
+        test_loss = test_metrics.get("loss", float("nan"))
+        current_mape = test_metrics.get("flow_mape", float("inf"))
+
+        if do_eval and current_mape < best_test_mape:
+            best_test_mape = current_mape
+            # torch.compile 后需要 .module 获取原始 state_dict
+            state_to_save = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+            best_state = deepcopy(state_to_save)
+            torch.save(best_state, os.path.join(result_dir, "best_seq2seq_model.pth"))
+
         scheduler.step()
         lr_now = optimizer.param_groups[0]["lr"]
 
         history.append({
             "epoch": epoch, "train_loss": train_loss, "test_loss": test_loss,
-            "flow_mae": test_metrics["flow_mae"], "flow_rmse": test_metrics["flow_rmse"],
-            "flow_mape": test_metrics["flow_mape"], "lr": lr_now
+            "flow_mae": test_metrics.get("flow_mae", float("nan")),
+            "flow_rmse": test_metrics.get("flow_rmse", float("nan")),
+            "flow_mape": current_mape, "lr": lr_now
         })
 
-        # 更新 epoch 进度条后缀, 显示关键指标 (MAPE 显示最优值)
-        current_mape = test_metrics["flow_mape"]
-        if current_mape < best_test_mape:
-            best_test_mape = current_mape
-            best_state = deepcopy(model.state_dict())
-            torch.save(best_state, os.path.join(result_dir, "best_seq2seq_model.pth"))
-
+        eval_tag = "" if do_eval else " [skip eval]"
         epoch_pbar.set_postfix(
             train_loss=f"{train_loss:.6f}",
-            test_loss=f"{test_loss:.6f}",
+            test_loss=f"{test_loss:.6f}" if not math.isnan(test_loss) else "---",
             best_MAPE=f"{best_test_mape:.2f}%",
-            cur_MAPE=f"{current_mape:.2f}%",
-            lr=f"{lr_now:.6f}"
+            cur_MAPE=f"{current_mape:.2f}%" if current_mape != float("inf") else "---",
+            lr=f"{lr_now:.6f}",
+            note=eval_tag,
         )
 
         if early_stopper.step(current_mape):
