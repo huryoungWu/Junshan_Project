@@ -37,7 +37,7 @@ from data_processing import DataProcessor
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA = r"D:\Junshan_Project\data\水厂2025年小时级汇总.csv"
 DEFAULT_RESULT_DIR = os.path.join(HERE, "results",
-                                  "junshan_L1D_P24H_1h_transformer_autoregressive_20260823_120030")
+                                  "junshan_L1D_P24H_1h_transformer_autoregressive_20260824_234455")
 
 
 # ==================== 工具函数 ====================
@@ -156,6 +156,8 @@ def main():
     df_base = processor.build_base_features(df_raw)
     df_clean = processor.clean_and_resample(df_base)
     df_feat = processor.add_calendar_features(df_clean)
+    df_feat = processor.add_data_driven_features(df_feat)
+    df_feat = df_feat.dropna(subset=feature_cols)
     df_feat = df_feat[feature_cols]
     data_scaled = feature_scaler.transform(df_feat.values.astype(np.float32))
     total_len = len(data_scaled)
