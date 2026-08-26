@@ -1,0 +1,4 @@
+[自回归单步版] detach_feedback=False, predict_steps=24
+Train: Loss=0.037925, MAE=136.30, RMSE=195.56, MAPE=4.29%
+Test: Loss=0.029954, MAE=156.70, RMSE=216.89, MAPE=5.24%
+MAPE 过滤: 排除 |true| < 10% * max|true| 的点 (Train 保留 226612/226680 点, Test 保留 21624/21624 点)
