@@ -6,6 +6,9 @@
 
   # 全天模式
   python eval_random_window.py --start_date 2025-01-08 --all_days
+
+  # 指定日期范围, 逐日画图保存
+  python eval_random_window.py --start_date 2025-10-01 --end_date 2025-12-31 --plot
 """
 
 import os
@@ -86,6 +89,12 @@ def main():
                         help="随机种子 (仅未指定 --start_date 时生效)")
     parser.add_argument("--all_days", action="store_true",
                         help="从 start_date 到数据末尾逐日预测")
+    parser.add_argument("--end_date", default=None,
+                        help="评估结束日期 (格式 YYYY-MM-DD, 配合 --start_date 使用)")
+    parser.add_argument("--plot", action="store_true",
+                        help="逐日画图并保存到本地")
+    parser.add_argument("--plot_dir", default=None,
+                        help="逐日图片保存目录 (默认: result_dir/daily_plots)")
     parser.add_argument("--encoding", default="utf-8-sig", help="CSV 编码")
     args = parser.parse_args()
 
@@ -188,7 +197,13 @@ def main():
 
     # ── 计算可预测天数 ──
     max_pred_days = (total_len - first_pred_idx) // points_per_day
-    if args.all_days:
+    if args.end_date is not None:
+        # 指定结束日期: 计算 start_date 到 end_date 之间的天数
+        end_date = pd.Timestamp(args.end_date)
+        pred_start_date = df_feat.index[first_pred_idx]
+        n_predict_days = (end_date - pred_start_date).days + 1
+        n_predict_days = max(1, min(n_predict_days, max_pred_days))
+    elif args.all_days:
         n_predict_days = max_pred_days
     else:
         n_predict_days = min(lookback, max_pred_days)
@@ -208,6 +223,13 @@ def main():
     all_day_preds = []
     all_day_trues = []
     all_day_timestamps = []
+
+    # 逐日画图: 如果指定了 --plot, 每天保存一张独立的图
+    plot_dir = None
+    if args.plot:
+        plot_dir = args.plot_dir or os.path.join(args.result_dir, "daily_plots")
+        os.makedirs(plot_dir, exist_ok=True)
+        print(f"  逐日图片将保存到: {plot_dir}")
 
     for day in range(n_predict_days):
         pred_start = first_pred_idx + day * points_per_day
@@ -240,8 +262,34 @@ def main():
         all_day_trues.append(true_inv)
         all_day_timestamps.append(df_feat.index[pred_start:pred_end])
 
+        # 逐日画图并保存
+        if plot_dir is not None:
+            ts = df_feat.index[pred_start:pred_end]
+            d_mae, d_rmse, d_mape = calc_metrics(true_inv, pred_inv)
+
+            plt.rcParams["font.sans-serif"] = ["SimHei"]
+            plt.rcParams["axes.unicode_minus"] = False
+            fig, ax = plt.subplots(figsize=(12, 5))
+            ax.plot(ts, true_inv, "b-o", markersize=2, linewidth=1.2, label="真实值")
+            ax.plot(ts, pred_inv, "r-s", markersize=2, linewidth=1.2, label="预测值")
+            ax.fill_between(ts, true_inv, pred_inv, alpha=0.15, color="gray")
+            ax.set_title(f"{ts[0].strftime('%Y-%m-%d')}  "
+                         f"MAE={d_mae:.2f}  RMSE={d_rmse:.2f}  MAPE={d_mape:.2f}%",
+                         fontsize=12, fontweight="bold")
+            ax.set_xlabel("时间", fontsize=10)
+            ax.set_ylabel("流量", fontsize=10)
+            ax.legend(fontsize=10, loc="upper right")
+            ax.grid(alpha=0.3)
+            plt.tight_layout()
+            date_str = ts[0].strftime("%Y-%m-%d")
+            fig.savefig(os.path.join(plot_dir, f"{date_str}.png"),
+                        dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
     n_actual = len(all_day_preds)
     print(f"实际预测: {n_actual} 天")
+    if plot_dir is not None:
+        print(f"  逐日图片已保存: {plot_dir} ({n_actual} 张)")
 
     # ── 原始指标 ──
     all_true = np.concatenate(all_day_trues)
