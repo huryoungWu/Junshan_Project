@@ -310,6 +310,20 @@ def main():
                                   f"   → {'✅ 与训练一致' if ok else '❌ 不一致 (请检查范围是否覆盖整个测试集)'}")
                         break
 
+    # ── 流量区间 MAPE 分析 ──
+    # ts_all[sample_starts_used] 是每个样本的起始时刻 (1969 个),
+    # 但 y_true_all/y_pred_all 是展平的 (1969*24=47256 个点),
+    # 需要把时间戳展开: 每个起始时刻 → 后续 predict_steps 个时间点
+    expanded_ts = np.concatenate([
+        ts_all[i:i + predict_steps] for i in sample_starts_used
+    ])
+    save_dir_flow = os.path.join(HERE, "flow_range_analysis")
+    analyze_mape_by_flow_range(
+        y_true_all, y_pred_all, expanded_ts,
+        flow_min=1000, flow_max=5000, flow_step=100,
+        floor_ratio=floor, save_dir=save_dir_flow,
+    )
+
     # ── 逐日视图: 每天 00:00 起点的 24h 预测 (可读性用, 不参与汇总) ──
     daily = []      # (date, pred_inv, true_inv, ts, 样本起点下标)
     for idx, i in enumerate(sample_starts_used):
@@ -380,6 +394,348 @@ def main():
         fig.savefig(fig_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"\n预测对比图已保存: {fig_path}")
+
+
+def analyze_mape_by_flow_range(y_true_all, y_pred_all, timestamps,
+                                flow_min=1000, flow_max=5000, flow_step=100,
+                                floor_ratio=0.1, save_dir=None):
+    """按真实流量区间分析 MAPE 分布 + 各区间误差最大的时刻。
+
+    将真实流量按 flow_step 步长分箱 (默认 1000~5000, 步长 100),
+    统计每个区间的 MAPE / MAE / RMSE / 样本数, 并分析每个区间内
+    误差最大的时刻分布。
+
+    Args:
+        y_true_all: (N,) 真实流量数组 (已反归一化, m³/h)
+        y_pred_all: (N,) 预测流量数组 (已反归一化, m³/h)
+        timestamps: (N,) 时间戳数组 (datetime64 或 pd.DatetimeIndex)
+        flow_min:   流量区间下界 (默认 1000)
+        flow_max:   流量区间上界 (默认 5000)
+        flow_step:  步长 (默认 100)
+        floor_ratio: MAPE 过滤阈值 (与训练一致)
+        save_dir:   图片保存目录 (None 则不画图)
+    """
+    y_true = np.asarray(y_true_all).reshape(-1)
+    y_pred = np.asarray(y_pred_all).reshape(-1)
+    ts = pd.DatetimeIndex(timestamps) if not isinstance(timestamps, pd.DatetimeIndex) else timestamps
+    n_total = len(y_true)
+    if n_total == 0:
+        print("  ⚠ 无样本, 跳过流量区间分析")
+        return None
+    if len(ts) != n_total:
+        print(f"  ⚠ 时间戳长度 ({len(ts)}) != 样本数 ({n_total}), 跳过流量区间分析")
+        return None
+
+    # ── 构造流量区间 ──
+    bins = np.arange(flow_min, flow_max + flow_step, flow_step)
+    labels = [f"{bins[i]:.0f}-{bins[i+1]:.0f}" for i in range(len(bins) - 1)]
+
+    # ── 分箱: 每个样本分配到对应区间 ──
+    bin_indices = np.digitize(y_true, bins) - 1   # 0-indexed
+    # 超出范围的样本归到两端
+    bin_indices = np.clip(bin_indices, 0, len(labels) - 1)
+
+    # ── 逐区间统计 ──
+    rows = []
+    all_hour_errors = {}   # {bin_label: {hour: [abs_errors]}}
+    worst_samples = {}     # {bin_label: [(abs_err, hour, true_val, pred_val, ts)]}
+
+    thr = floor_ratio * np.abs(y_true).max()
+
+    for b in range(len(labels)):
+        mask = bin_indices == b
+        n_bin = int(mask.sum())
+        if n_bin == 0:
+            rows.append({
+                "flow_range": labels[b], "n_samples": 0,
+                "mape": np.nan, "mae": np.nan, "rmse": np.nan,
+                "mean_true": np.nan, "max_abs_err": np.nan,
+                "worst_hour": np.nan, "worst_ts": np.nan,
+            })
+            continue
+
+        t = y_true[mask]
+        p = y_pred[mask]
+        abs_err = np.abs(t - p)
+        # MAPE: 仅对 |true| >= thr 的点
+        mape_mask = np.abs(t) >= thr
+        if mape_mask.sum() > 0:
+            mape = np.mean(np.abs((t[mape_mask] - p[mape_mask]) / (t[mape_mask] + 1e-8))) * 100
+        else:
+            mape = np.nan
+        mae = float(abs_err.mean())
+        rmse = float(np.sqrt((abs_err ** 2).mean()))
+
+        # 每个小时的误差分布
+        bin_ts = ts[mask]
+        hours = bin_ts.hour
+        for h in range(24):
+            h_mask = hours == h
+            if h_mask.sum() > 0:
+                key = (labels[b], h)
+                if labels[b] not in all_hour_errors:
+                    all_hour_errors[labels[b]] = {}
+                all_hour_errors[labels[b]].setdefault(h, []).extend(abs_err[h_mask].tolist())
+
+        # 误差最大的样本
+        worst_idx_local = np.argsort(abs_err)[-5:][::-1]
+        worst_list = []
+        for wi in worst_idx_local:
+            orig_idx = np.where(mask)[0][wi]
+            worst_list.append({
+                "abs_err": float(abs_err[wi]),
+                "hour": int(hours[wi]),
+                "true": float(t[wi]),
+                "pred": float(p[wi]),
+                "timestamp": str(ts[orig_idx]),
+            })
+        worst_samples[labels[b]] = worst_list
+
+        rows.append({
+            "flow_range": labels[b], "n_samples": n_bin,
+            "mape": float(mape), "mae": mae, "rmse": rmse,
+            "mean_true": float(t.mean()),
+            "max_abs_err": float(abs_err.max()),
+            "worst_hour": int(hours[np.argmax(abs_err)]),
+            "worst_ts": str(bin_ts[np.argmax(abs_err)]),
+        })
+
+    df_range = pd.DataFrame(rows)
+
+    # ── 打印结果 ──
+    print(f"\n{'=' * 80}")
+    print(f" 流量区间 MAPE 分析 (范围 {flow_min}~{flow_max}, 步长 {flow_step})")
+    print(f"{'=' * 80}")
+    valid = df_range[df_range["n_samples"] > 0].copy()
+    print(f"  {'流量区间':<18}{'样本数':<8}{'MAPE%':<10}{'MAE':<10}{'RMSE':<10}"
+          f"{'均值流量':<12}{'最大误差':<10}{'误差最大时'}")
+    print(f"  {'-' * 86}")
+    for _, r in valid.iterrows():
+        mape_str = f"{r['mape']:.2f}" if not np.isnan(r['mape']) else "N/A"
+        n_samp = int(r['n_samples'])
+        worst_h = int(r['worst_hour']) if not np.isnan(r['worst_hour']) else 0
+        print(f"  {r['flow_range']:<18}{n_samp:<8}{mape_str:<10}"
+              f"{r['mae']:<10.2f}{r['rmse']:<10.2f}"
+              f"{r['mean_true']:<12.1f}{r['max_abs_err']:<10.2f}"
+              f"{worst_h:02d}:00")
+
+    # ── 找出误差最大的区间 ──
+    if len(valid) > 0:
+        best_mape_row = valid.loc[valid["mape"].idxmin()]
+        worst_mape_row = valid.loc[valid["mape"].idxmax()]
+        print(f"\n  MAPE 最低区间: {best_mape_row['flow_range']}  MAPE={best_mape_row['mape']:.2f}%")
+        print(f"  MAPE 最高区间: {worst_mape_row['flow_range']}  MAPE={worst_mape_row['mape']:.2f}%")
+
+    # ── 分析各区间误差最大的时刻分布 ──
+    print(f"\n{'=' * 80}")
+    print(f" 各流量区间误差最大的 5 个样本")
+    print(f"{'=' * 80}")
+    for b_label, worst_list in worst_samples.items():
+        if not worst_list:
+            continue
+        print(f"\n  [{b_label}] (前 5 个最大误差样本):")
+        for i, w in enumerate(worst_list):
+            print(f"    #{i+1}  AE={w['abs_err']:.2f}  hour={w['hour']:02d}:00  "
+                  f"true={w['true']:.1f}  pred={w['pred']:.1f}  ts={w['timestamp']}")
+
+    # ── 按流量区间 × 小时的误差热力图数据 ──
+    print(f"\n{'=' * 80}")
+    print(f" 流量区间 × 小时 平均绝对误差 (AE) 热力图")
+    print(f"{'=' * 80}")
+
+    heatmap_data = np.full((len(labels), 24), np.nan)
+    for b_label, hour_dict in all_hour_errors.items():
+        b_idx = labels.index(b_label)
+        for h, errs in hour_dict.items():
+            heatmap_data[b_idx, h] = np.mean(errs)
+
+    # 只打印有数据的行
+    has_data_rows = ~np.all(np.isnan(heatmap_data), axis=1)
+    if has_data_rows.any():
+        # 表头: 小时
+        hour_header = "  流量区间\\小时  " + "".join(f"{h:>6}" for h in range(24))
+        print(hour_header)
+        print(f"  {'-' * (14 + 24 * 6)}")
+        for b_idx in range(len(labels)):
+            if not has_data_rows[b_idx]:
+                continue
+            row_str = f"  {labels[b_idx]:<14}"
+            for h in range(24):
+                val = heatmap_data[b_idx, h]
+                if np.isnan(val):
+                    row_str += f"{'—':>6}"
+                else:
+                    row_str += f"{val:>6.0f}"
+            print(row_str)
+
+    # ── 综合: 每个小时整体误差 ──
+    print(f"\n{'=' * 80}")
+    print(f" 按小时的整体误差分布 (跨所有流量区间)")
+    print(f"{'=' * 80}")
+    hours_all = ts.hour
+    hour_rows = []
+    for h in range(24):
+        h_mask = hours_all == h
+        n_h = int(h_mask.sum())
+        if n_h == 0:
+            continue
+        h_true = y_true[h_mask]
+        h_pred = y_pred[h_mask]
+        h_abs_err = np.abs(h_true - h_pred)
+        h_mape_mask = np.abs(h_true) >= thr
+        h_mape = (np.mean(np.abs((h_true[h_mape_mask] - h_pred[h_mape_mask]) /
+                                  (h_true[h_mape_mask] + 1e-8))) * 100
+                  if h_mape_mask.sum() > 0 else np.nan)
+        hour_rows.append({
+            "hour": h, "n_samples": n_h,
+            "mae": float(h_abs_err.mean()),
+            "rmse": float(np.sqrt((h_abs_err ** 2).mean())),
+            "mape": float(h_mape),
+            "max_ae": float(h_abs_err.max()),
+        })
+
+    df_hour = pd.DataFrame(hour_rows)
+    if len(df_hour) > 0:
+        print(f"  {'小时':<8}{'样本数':<8}{'MAE':<10}{'RMSE':<10}{'MAPE%':<10}{'最大AE':<10}")
+        print(f"  {'-' * 54}")
+        for _, r in df_hour.iterrows():
+            mape_str = f"{r['mape']:.2f}" if not np.isnan(r['mape']) else "N/A"
+            print(f"  {int(r['hour']):02d}:00   {int(r['n_samples']):<8}"
+                  f"{r['mae']:<10.2f}{r['rmse']:<10.2f}{mape_str:<10}{r['max_ae']:<10.2f}")
+
+        # 找出误差最大的小时
+        worst_hour_row = df_hour.loc[df_hour["mape"].idxmax()]
+        best_hour_row = df_hour.loc[df_hour["mape"].idxmin()]
+        print(f"\n  MAPE 最高小时: {int(worst_hour_row['hour']):02d}:00  "
+              f"MAPE={worst_hour_row['mape']:.2f}%  MAE={worst_hour_row['mae']:.2f}")
+        print(f"  MAPE 最低小时: {int(best_hour_row['hour']):02d}:00  "
+              f"MAPE={best_hour_row['mape']:.2f}%  MAE={best_hour_row['mae']:.2f}")
+
+    # ── 画图 ──
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        plt.rcParams["font.sans-serif"] = ["SimHei"]
+        plt.rcParams["axes.unicode_minus"] = False
+
+        # 图1: 各流量区间 MAPE 柱状图
+        fig, axes = plt.subplots(2, 2, figsize=(20, 14))
+
+        ax = axes[0, 0]
+        plot_valid = valid[valid["mape"].notna()].copy()
+        if len(plot_valid) > 0:
+            colors = plt.cm.RdYlGn_r(np.linspace(0.2, 0.8, len(plot_valid)))
+            bars = ax.bar(range(len(plot_valid)), plot_valid["mape"], color=colors,
+                          edgecolor="white", linewidth=0.5)
+            ax.set_xticks(range(len(plot_valid)))
+            ax.set_xticklabels(plot_valid["flow_range"], rotation=45, ha="right", fontsize=7)
+            ax.set_xlabel("真实流量区间 (m³/h)")
+            ax.set_ylabel("MAPE (%)")
+            ax.set_title("各流量区间 MAPE 分布")
+            ax.grid(axis="y", alpha=0.3)
+            # 标注数值
+            for bar, val in zip(bars, plot_valid["mape"]):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
+                        f"{val:.1f}", ha="center", va="bottom", fontsize=6)
+        ax.axhline(y=5.0, color="red", linestyle="--", linewidth=1.2, label="5% 阈值")
+        ax.legend(fontsize=9)
+
+        # 图2: 各流量区间样本数
+        ax = axes[0, 1]
+        ax.bar(range(len(valid)), valid["n_samples"], color="#3498db",
+               edgecolor="white", alpha=0.8)
+        ax.set_xticks(range(len(valid)))
+        ax.set_xticklabels(valid["flow_range"], rotation=45, ha="right", fontsize=7)
+        ax.set_xlabel("真实流量区间 (m³/h)")
+        ax.set_ylabel("样本数")
+        ax.set_title("各流量区间样本数分布")
+        ax.grid(axis="y", alpha=0.3)
+
+        # 图3: 各流量区间 MAE
+        ax = axes[1, 0]
+        ax.bar(range(len(valid)), valid["mae"], color="#e74c3c",
+               edgecolor="white", alpha=0.8)
+        ax.set_xticks(range(len(valid)))
+        ax.set_xticklabels(valid["flow_range"], rotation=45, ha="right", fontsize=7)
+        ax.set_xlabel("真实流量区间 (m³/h)")
+        ax.set_ylabel("MAE (m³/h)")
+        ax.set_title("各流量区间 MAE 分布")
+        ax.grid(axis="y", alpha=0.3)
+
+        # 图4: 热力图 — 流量区间 × 小时 平均绝对误差
+        ax = axes[1, 1]
+        # 只画有数据的行
+        plot_heatmap = heatmap_data[has_data_rows]
+        plot_labels = [labels[i] for i in range(len(labels)) if has_data_rows[i]]
+        if plot_heatmap.size > 0:
+            im = ax.imshow(plot_heatmap, aspect="auto", cmap="YlOrRd",
+                           interpolation="nearest")
+            ax.set_xticks(range(24))
+            ax.set_xticklabels([f"{h:02d}" for h in range(24)], fontsize=8)
+            ax.set_yticks(range(len(plot_labels)))
+            ax.set_yticklabels(plot_labels, fontsize=7)
+            ax.set_xlabel("小时")
+            ax.set_ylabel("真实流量区间 (m³/h)")
+            ax.set_title("流量区间 × 小时 平均绝对误差 (AE) 热力图")
+            plt.colorbar(im, ax=ax, label="AE (m³/h)")
+
+        fig.suptitle("流量区间 MAPE 分析", fontsize=14, fontweight="bold")
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        fig_path = os.path.join(save_dir, "flow_range_mape_analysis.png")
+        fig.savefig(fig_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"\n  流量区间分析图已保存: {fig_path}")
+
+        # 图5: 小时维度 MAPE / MAE 双轴图
+        if len(df_hour) > 0:
+            fig2, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+
+            ax1.bar(df_hour["hour"], df_hour["mape"], color="#e74c3c", alpha=0.7, label="MAPE (%)")
+            ax1.set_xlabel("小时")
+            ax1.set_ylabel("MAPE (%)")
+            ax1.set_title("各小时 MAPE 分布 (跨所有流量区间)")
+            ax1.set_xticks(range(24))
+            ax1.set_xticklabels([f"{h:02d}:00" for h in range(24)], fontsize=8)
+            ax1.axhline(y=5.0, color="black", linestyle="--", linewidth=1, label="5% 阈值")
+            ax1.legend(fontsize=9)
+            ax1.grid(axis="y", alpha=0.3)
+
+            ax2.bar(df_hour["hour"], df_hour["mae"], color="#3498db", alpha=0.7, label="MAE (m³/h)")
+            ax2_twin = ax2.twinx()
+            ax2_twin.plot(df_hour["hour"], df_hour["max_ae"], "r-o", markersize=4,
+                          linewidth=1.5, label="最大 AE")
+            ax2.set_xlabel("小时")
+            ax2.set_ylabel("MAE (m³/h)")
+            ax2_twin.set_ylabel("最大 AE (m³/h)")
+            ax2.set_title("各小时 MAE / 最大 AE 分布")
+            ax2.set_xticks(range(24))
+            ax2.set_xticklabels([f"{h:02d}:00" for h in range(24)], fontsize=8)
+            lines1, labels1 = ax2.get_legend_handles_labels()
+            lines2, labels2 = ax2_twin.get_legend_handles_labels()
+            ax2.legend(lines1 + lines2, labels1 + labels2, fontsize=9)
+            ax2.grid(axis="y", alpha=0.3)
+
+            fig2.suptitle("小时维度误差分析", fontsize=14, fontweight="bold")
+            fig2.tight_layout(rect=(0, 0, 1, 0.96))
+            fig2_path = os.path.join(save_dir, "hourly_error_analysis.png")
+            fig2.savefig(fig2_path, dpi=200, bbox_inches="tight")
+            plt.close(fig2)
+            print(f"  小时维度误差分析图已保存: {fig2_path}")
+
+        # 图6: 散点图 — 真实流量 vs 绝对误差
+        fig3, ax = plt.subplots(figsize=(12, 6))
+        scatter = ax.scatter(y_true, np.abs(y_true - y_pred), c=ts.hour, cmap="hsv",
+                             alpha=0.3, s=5, vmin=0, vmax=23)
+        ax.set_xlabel("真实流量 (m³/h)")
+        ax.set_ylabel("绝对误差 (m³/h)")
+        ax.set_title("真实流量 vs 绝对误差 (颜色=小时)")
+        ax.grid(alpha=0.3)
+        plt.colorbar(scatter, ax=ax, label="小时 (0-23)")
+        fig3_path = os.path.join(save_dir, "flow_vs_error_scatter.png")
+        fig3.savefig(fig3_path, dpi=200, bbox_inches="tight")
+        plt.close(fig3)
+        print(f"  流量-误差散点图已保存: {fig3_path}")
+
+    return df_range, df_hour
 
 
 if __name__ == "__main__":

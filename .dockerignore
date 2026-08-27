@@ -1,8 +1,0 @@
-# Docker 构建上下文瘦身 (镜像构建只用到 requirements.txt + docker/ 下文件)
-# 注意: 不能排除 docker/ 自身, Dockerfile 要 COPY 其中的 crontab 和 run_pipeline.sh
-*.csv
-*.parquet
-logs/
-__pycache__/
-transformer_pkg/results/
-transformer_pkg/__pycache__/
