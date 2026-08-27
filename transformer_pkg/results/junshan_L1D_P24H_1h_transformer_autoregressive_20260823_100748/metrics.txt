@@ -1,6 +1,0 @@
-[自回归单步版] detach_feedback=True, predict_steps=24
-Train: Loss=0.111654, MAE=215.17, RMSE=321.74, MAPE=6.64%
-Test: Loss=0.064474, MAE=173.84, RMSE=244.49, MAPE=6.18%
-MAPE 过滤: 排除 |true| < 10% * max|true| 的点 (Train 保留 21469/21552 点, Test 保留 552/552 点)
-ewma_alpha=0.7
-EWMA修正(alpha=0.7): MAE=168.27, RMSE=233.10, MAPE=5.98%
