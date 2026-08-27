@@ -77,7 +77,7 @@ BASE_CONFIG = {
     "predict_days": 1.0,
     "label": f"junshan_L1D_P24H_1h_transformer_autoregressive_{time.strftime('%Y%m%d_%H%M%S')}",
 
-    "test_days": 90,
+    "test_days": 60,
 
     "mape_floor_ratio": 0.1,
     "target_transform": None,
