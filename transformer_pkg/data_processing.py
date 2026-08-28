@@ -256,10 +256,13 @@ class DataProcessor:
         flow = out["Total_Flow"]
 
         # ── 1. 滞后特征: 昨天/上周同时段 (Part2: 日内形状日间高度重复) ──
+        # lag_*: 纯 shift, 只用过去点, 无泄露。
+        # lag_24h_diff/ratio: 原版含 flow[t] (预测目标) → 泄露。改为以最近已知点
+        #   flow[t-1] 为基准对 24h 前做差/比, 结构不变 (X 对 24h 前的 X), 全过去。
         out["lag_24h"] = flow.shift(24).astype(np.float32)
         out["lag_168h"] = flow.shift(168).astype(np.float32)
-        out["lag_24h_diff"] = (flow - flow.shift(24)).astype(np.float32)
-        out["lag_24h_ratio"] = (flow / flow.shift(24).replace(0, np.nan)).astype(np.float32)
+        out["lag_24h_diff"] = (flow.shift(1) - flow.shift(25)).astype(np.float32)
+        out["lag_24h_ratio"] = (flow.shift(1) / flow.shift(25).replace(0, np.nan)).astype(np.float32)
 
         # ── 2. 滚动统计: 多尺度趋势 (Part1: 多项式拟合的离散近似) ──
         # shift(1): 严格用当前时刻之前的数据, 避免信息泄露
@@ -306,13 +309,15 @@ class DataProcessor:
         for col in day_feats.columns:
             out[col] = day_dates.map(day_feats[col]).astype(np.float32)
 
-        # ── 4. 偏离特征: 当前值相对近期水平 (Part1: 拟合残差的统计描述) ──
+        # ── 4. 偏离特征: 最近已知值相对近期水平 (Part1: 拟合残差的统计描述) ──
+        # 原版用 flow[t] (预测目标) → 泄露。改为 flow.shift(1)=flow[t-1] (最近已知
+        #   小时) 对滚动均值/标准差做 zscore; roll_mean_7d 等本身只用 ≤t-1, 全过去。
         r7_mean = out["roll_mean_7d"]
         r7_std = out["roll_std_7d"].replace(0, np.nan)
-        out["flow_zscore_7d"] = ((flow - r7_mean) / r7_std).astype(np.float32)
+        out["flow_zscore_7d"] = ((flow.shift(1) - r7_mean) / r7_std).astype(np.float32)
 
         r30_std = flow_shifted.rolling(720, min_periods=360).std().replace(0, np.nan)
-        out["flow_zscore_30d"] = ((flow - out["roll_mean_30d"]) / r30_std).astype(np.float32)
+        out["flow_zscore_30d"] = ((flow.shift(1) - out["roll_mean_30d"]) / r30_std).astype(np.float32)
 
         return out
 

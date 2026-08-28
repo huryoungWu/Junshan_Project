@@ -4,8 +4,8 @@ import argparse
 import math
 import pickle
 import random
+import time
 from copy import deepcopy
-from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -22,45 +22,32 @@ from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-import time
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-# ── 共享模块 (与 train_transformer.py 同目录, 不改动原文件) ──
+# ── 共享模块 (与 train_transformer_autoregressive.py 同目录, 不改动原文件) ──
 from transformer_model import TimeSeriesTransformer
 from itransformer_model import iTransformer
-from data_processing import DataProcessor
+from data_processing import DataProcessor, SeqDataset
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # ============================================================================
-# train_transformer_autoregressive.py — 单步自回归版训练脚本 (新文件)
+# train_transformer_direct.py — 直接多步 (非自回归) 版训练脚本 (新文件)
 #
-# 与 train_transformer.py 的区别:
-#   train_transformer.py  : 模型 head 直接一次输出整个 horizon (直接多步),
-#                           无自回归, 训练并行, 推理一次出 24 步。
-#   本文件                : 模型 head 只输出 1 步 (horizon=1), 预测下一个点;
-#                           把上一轮的预测结果当作输入窗口的最新一行 (覆盖目标
-#                           通道), 再喂给模型预测下一个点, 循环往复, 滚动预测
-#                           整个 horizon。训练与评估都用同一套自回归 rollout。
+# 与 train_transformer_autoregressive.py 的区别:
+#   自回归版              : 模型 head 只输出 1 步 (horizon=1), 把上一轮预测回灌
+#                          为输入窗口最新行, 滚动 rollout predict_steps 次; 训练
+#                          时每个 batch 做 predict_steps 次 forward。
+#   本文件 (直接多步)    : 模型 head 直接一次输出整个 horizon (horizon=predict_steps),
+#                          一次 forward 出 24 步, 无自回归 / 无回灌 / 无 rollout;
+#                          训练并行, 推理一次出 24 步。
 #
-# 自回归 rollout 细节:
-#   - 模型仅预测目标通道 (Total_Flow, output_dim=1)。输入窗口 = Total_Flow +
-#     日历特征 (hour_sin/cos, dow_sin/cos, month_sin/cos, doy_sin/cos,
-#     is_workday, is_holiday, holiday_eve, holiday_next, 由
-#     data_processing.add_calendar_features 由时刻确定性生成;
-#     运行泵数量/泵状态/泵频率/压力均不作为输入特征 —— 这些量每小时可能变化, 不进模型)。
-#   - 每一步: model(window) → 预测下一个时刻的流量 (标量) → 取"未来特征行"
-#     (ground-truth, 训练/评估时数据集里已有; 日历特征本来就是确定性的真值),
-#     把其中的目标通道替换成本轮预测值 → 拼到窗口末尾, 丢掉最旧一行, 滑窗
-#     前进一步 → 预测下一时刻。
-#   - 目标通道每步被本轮预测覆盖 → 纯单变量自回归; 日历特征作为外生通道用
-#     真值补齐 (时刻确定, 无需预测, 天然 teacher forcing)。
-#   - detach_feedback: True (默认) —— 回灌到下一步输入的预测值 detach, 梯度
-#     只训练当前步; 这样模型仍能看到"自己上一轮的预测"作为上下文 (缓解
-#     exposure bias), 又避免 24 步 BPTT 的显存/数值不稳定。设 False 则完整
-#     BPTT (梯度穿过整条 rollout 链, 显存按 horizon 倍增)。
+# 数据口径与自回归版完全一致 (清洗 / 日历特征 / 数据驱动特征 / scaler / 划分),
+# 仅替换"前向输出方式":
+#   - 不需要未来外生特征行 Xf (直接多步不滚动, 无需补齐外生通道)
+#   - 用 DataProcessor.make_sequences (X, Y 两元组) 而非 make_sequences_ar (X, Y, Xf)
+#   - 模型工厂里 horizon=predict_steps (整段 horizon 一次输出)
 #
-# 其余 (数据清洗 / 评估管线 / 画图 / 按起点时刻统计) 与 train_transformer.py
-# 完全一致, 仅替换"前向输出方式"。
+# 其余 (评估管线 / 画图 / 按起点时刻统计 / 峰值增强) 与自回归版完全一致。
 # ============================================================================
 
 BASE_CONFIG = {
@@ -75,31 +62,28 @@ BASE_CONFIG = {
 
     "lookback_days": 7,
     "predict_days": 1.0,
-    "label": f"junshan_L1D_P24H_1h_transformer_autoregressive_{time.strftime('%Y%m%d_%H%M%S')}",
+    "label": f"junshan_L1D_P24H_1h_transformer_direct_{time.strftime('%Y%m%d_%H%M%S')}",
 
     "test_days": 90,
 
     "mape_floor_ratio": 0.1,
     "target_transform": None,
 
-    # ── Transformer 架构超参 (head 改为单步: horizon=1 在工厂里固定) ──
+    # ── Transformer 架构超参 (head 直接多步: horizon=predict_steps 在工厂里给定) ──
     "d_model": 32,
     "nhead": 4,
     "num_layers": 3,
     "dim_feedforward": 256,
     "transformer_dropout": 0.2,
 
-    "model_type": "transformer",  # transformer | itransformer
-
-    # 自回归专用: 回灌的预测值是否 detach (True=稳定省显存, False=完整 BPTT)
-    "detach_feedback": True,
+    "model_type": "itransformer",  # transformer | itransformer
 
     # 峰值样本增强配置
-    "peak_augment_ratio": 0.4,      # 增强比例：增强后的峰值样本占总样本数的比例
-    "peak_threshold_ratio": 0.5,    # 峰值判定阈值：相对于训练集最大值的比例
+    "peak_augment_ratio": 0.0,      # 增强比例：增强后的峰值样本占总样本数的比例
+    "peak_threshold_ratio": 0.7,    # 峰值判定阈值：相对于训练集最大值的比例
 
-    # 训练超参 (自回归 rollout 每步一次 forward, horizon=24 → 每 batch 24 次
-    # forward; batch 降到 16 以控显存)
+    # 训练超参 (直接多步一次 forward 出 horizon 步, 比 rollout 快 horizon 倍;
+    # batch 可放大省显存无虞)
     "batch_size": 64,
     "epochs": 40,
     "learning_rate": 5e-4,
@@ -177,58 +161,20 @@ def compute_mape(y_true, y_pred, floor_ratio=0.05):
     return mape, n_total, n_used
 
 
-# ==================== 自回归核心: 单步滚动 rollout ====================
-
-def autoregressive_rollout(model, src, future_exog, predict_steps,
-                           target_feat_idx, detach_feedback=True):
-    """单步自回归 rollout: 把上一轮预测回灌为输入, 滚动预测 predict_steps 个点。
-
-    输入:
-      src          : (B, L, C) ground-truth 回看窗口 (feature 域)
-      future_exog  : (B, H, C) 未来 H 步的 ground-truth 外生特征行; 其中目标通道
-                     (target_feat_idx) 会被本轮预测值覆盖, 其余通道 (日历特征等)
-                     用真值 (外生 teacher forcing)
-      target_feat_idx: 目标通道在 C 维的下标 (Total_Flow 在 feature_cols 中的位置)
-      detach_feedback: True → 回灌预测值 detach, 梯度只训练当前步 (省显存, 稳定);
-                       False → 完整 BPTT, 梯度穿过整条 rollout 链
-    输出:
-      preds : (B, H, 1) 预测序列 (target 域, 与 target_scaler 一致)
-    """
-    window = src                       # (B, L, C), 滑窗前移
-    preds = []
-    for k in range(predict_steps):
-        one = model(window, target_len=1)              # (B, 1, 1) 单步预测
-        preds.append(one[:, 0:1, :])                   # (B, 1, 1)
-
-        # 下一行: 取未来外生特征行, 目标通道替换成本轮预测 (回灌)
-        feedback = one[:, 0, 0]                        # (B,)
-        if detach_feedback:
-            feedback = feedback.detach()
-        next_row = future_exog[:, k:k + 1, :].clone()  # (B, 1, C)
-        next_row[:, 0, target_feat_idx] = feedback      # 覆盖目标通道
-
-        # 滑窗: 丢最旧一行, 末尾拼上 next_row
-        window = torch.cat([window[:, 1:, :], next_row], dim=1)
-
-    return torch.cat(preds, dim=1)                     # (B, H, 1)
-
-
 # ==================== 评估 ====================
 
-def evaluate(model, loader, device, processor, predict_steps,
-             target_feat_idx, detach_feedback):
+def evaluate(model, loader, device, processor, predict_steps):
+    """直接多步评估: 一次 forward 出 predict_steps 步, 无 rollout。"""
     model.eval()
     total_loss = 0.0
     all_preds, all_trues = [], []
 
     with torch.no_grad():
-        for batch_x, batch_y, batch_xf in tqdm(loader, desc="Evaluating",
-                                                unit="batch", leave=False):
+        for batch_x, batch_y in tqdm(loader, desc="Evaluating",
+                                     unit="batch", leave=False):
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
-            batch_xf = batch_xf.to(device)
-            pred = autoregressive_rollout(model, batch_x, batch_xf, predict_steps,
-                                          target_feat_idx, detach_feedback)
+            pred = model(batch_x, target_len=predict_steps)   # (B, H, 1) 一次出全段
             loss = weighted_mse_loss(pred, batch_y)
             total_loss += loss.item() * len(batch_x)
             all_preds.append(pred.cpu().numpy())
@@ -381,59 +327,9 @@ def stat_by_start_time(y_true_inv, y_pred_inv, start_times, save_dir, floor_rati
               f"{r['mae']:<8.2f}  {r['rmse']:<8.2f}  {r['mape']:<8.2f}")
 
 
-# ==================== 数据序列 (带未来外生特征行) ====================
+# ==================== 峰值样本增强 (与自回归版一致, 去掉 Xf) ====================
 
-class ARSeqDataset(Dataset):
-    """每个样本返回 (回看窗口 X, 未来目标 Y, 未来外生特征行 X_future)。
-
-    X_future 用于自回归 rollout 时补齐每一步的外生通道 (目标通道由预测覆盖)。
-    """
-    def __init__(self, X, Y, Xf):
-        self.X = torch.from_numpy(np.ascontiguousarray(X))
-        self.Y = torch.from_numpy(np.ascontiguousarray(Y))
-        self.Xf = torch.from_numpy(np.ascontiguousarray(Xf))
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.Y[idx], self.Xf[idx]
-
-
-def make_sequences_ar(processor, x_array, y_array, lookback_days, predict_days):
-    """生成回看窗口 + 未来目标 + 未来外生特征行 (供自回归 rollout)。
-
-    与 DataProcessor.make_sequences 同口径, 额外返回 Xf = 每个 sample 的未来
-    horizon 步完整特征行 (含目标通道, 目标通道在 rollout 中被预测覆盖)。
-    """
-    freq_minutes = int(processor.config["resample_freq"].replace("min", ""))
-    points_per_day = (24 * 60) // freq_minutes
-    lookback_steps = int(lookback_days * points_per_day)
-    horizon_steps = int(predict_days * points_per_day)
-    stride = processor.config["stride"]
-
-    total_len = len(x_array)
-    n_samples = (total_len - lookback_steps - horizon_steps) // stride + 1
-    if n_samples <= 0:
-        empty = np.empty((0, lookback_steps, x_array.shape[1]), dtype=np.float32)
-        empty_h = np.empty((0, horizon_steps, x_array.shape[1]), dtype=np.float32)
-        empty_y = np.empty((0, horizon_steps, y_array.shape[1]), dtype=np.float32)
-        return empty, empty_y, empty_h
-
-    X = np.empty((n_samples, lookback_steps, x_array.shape[1]), dtype=np.float32)
-    Y = np.empty((n_samples, horizon_steps, y_array.shape[1]), dtype=np.float32)
-    Xf = np.empty((n_samples, horizon_steps, x_array.shape[1]), dtype=np.float32)
-
-    idx = 0
-    for i in range(0, total_len - lookback_steps - horizon_steps + 1, stride):
-        X[idx] = x_array[i:i + lookback_steps]
-        Y[idx] = y_array[i + lookback_steps:i + lookback_steps + horizon_steps]
-        Xf[idx] = x_array[i + lookback_steps:i + lookback_steps + horizon_steps]
-        idx += 1
-    return X, Y, Xf
-
-
-def augment_peak_samples(X, Y, Xf, peak_threshold_ratio=0.7, peak_augment_ratio=0.3):
+def augment_peak_samples(X, Y, peak_threshold_ratio=0.7, peak_augment_ratio=0.3):
     """峰值样本增强：对包含高峰时段的训练样本进行上采样。
 
     原理：
@@ -442,46 +338,34 @@ def augment_peak_samples(X, Y, Xf, peak_threshold_ratio=0.7, peak_augment_ratio=
     - 避免模型倾向于预测"均值"而低估峰值
 
     参数：
-    - X, Y, Xf: 原始训练序列
+    - X, Y: 原始训练序列 (直接多步无需 Xf)
     - peak_threshold_ratio: 峰值判定阈值（相对于整个训练集的最大值），默认0.7
     - peak_augment_ratio: 增强比例（增强后的峰值样本数占总样本数的比例），默认0.3
 
     返回：
-    - X_aug, Y_aug, Xf_aug: 增强后的序列
+    - X_aug, Y_aug: 增强后的序列
     """
     if len(X) == 0:
-        return X, Y, Xf
+        return X, Y
 
-    # 计算每个样本的最大值
     sample_max = Y[:, :, 0].max(axis=1)  # 每个样本的最大流量值
 
-    # 确定峰值阈值
     global_max = sample_max.max()
     threshold = peak_threshold_ratio * global_max
 
-    # 找出峰值样本的索引
     peak_indices = np.where(sample_max > threshold)[0]
 
     if len(peak_indices) == 0:
         print(f"  ⚠ 未找到峰值样本（阈值={threshold:.2f}），跳过增强")
-        return X, Y, Xf
+        return X, Y
 
-    # 计算需要增强的样本数
     n_original = len(X)
     n_target_aug = int(n_original * peak_augment_ratio)
-    n_to_add = max(0, n_target_aug - len(peak_indices))  # 只补充到目标数量
 
-    if n_to_add == 0:
-        # 峰值样本已足够，随机采样到目标数量
-        aug_indices = np.random.choice(peak_indices, n_target_aug, replace=True)
-    else:
-        # 峰值样本不足，需要重复采样
-        aug_indices = np.random.choice(peak_indices, n_target_aug, replace=True)
+    aug_indices = np.random.choice(peak_indices, n_target_aug, replace=True)
 
-    # 拼接原始数据和增强数据
     X_aug = np.concatenate([X, X[aug_indices]], axis=0)
     Y_aug = np.concatenate([Y, Y[aug_indices]], axis=0)
-    Xf_aug = np.concatenate([Xf, Xf[aug_indices]], axis=0)
 
     print(f"  ✅ 峰值样本增强完成:")
     print(f"     原始样本数: {n_original}")
@@ -490,7 +374,7 @@ def augment_peak_samples(X, Y, Xf, peak_threshold_ratio=0.7, peak_augment_ratio=
     print(f"     增强后总样本数: {len(X_aug)}")
     print(f"     峰值占比: {len(peak_indices)/n_original*100:.1f}% -> {min(1.0, (len(peak_indices)+len(aug_indices))/len(X_aug))*100:.1f}%")
 
-    return X_aug, Y_aug, Xf_aug
+    return X_aug, Y_aug
 
 
 # ==================== 单次实验运行 ====================
@@ -500,31 +384,29 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     lookback = cfg["lookback_days"]
     predict = cfg["predict_days"]
     label = cfg["label"]
-    detach_feedback = cfg.get("detach_feedback", True)
 
     result_dir = os.path.join(cfg["base_result_dir"], label)
     ensure_dir(result_dir)
 
     print(f"\n{'='*80}")
-    print(f" 实验(自回归单步): {label}  |  model_type={cfg.get('model_type', 'transformer')}"
+    print(f" 实验(直接多步): {label}  |  model_type={cfg.get('model_type', 'transformer')}"
           f"  |  lookback={lookback}d  |  predict={predict}d"
           f"  |  freq={cfg['resample_freq']}  |  test_days={cfg['test_days']}"
           f"  |  d_model={cfg['d_model']}  |  nhead={cfg['nhead']}"
-          f"  |  layers={cfg['num_layers']}  |  lr={cfg['learning_rate']}"
-          f"  |  detach_feedback={detach_feedback}")
+          f"  |  layers={cfg['num_layers']}  |  lr={cfg['learning_rate']}")
     print(f" 结果目录: {result_dir}")
     print(f"{'='*80}")
 
-    # 构建序列 (额外返回未来外生特征行 X_future)
-    X_train, Y_train, Xf_train = make_sequences_ar(processor, x_train_all, y_train_all, lookback, predict)
-    X_test, Y_test, Xf_test = make_sequences_ar(processor, x_test_all, y_test_all, lookback, predict)
+    # 构建序列 (直接多步: 仅 X, Y 两元组, 无需未来外生特征行)
+    X_train, Y_train = processor.make_sequences(x_train_all, y_train_all, lookback, predict)
+    X_test, Y_test = processor.make_sequences(x_test_all, y_test_all, lookback, predict)
 
     # 峰值样本增强（仅对训练集）
     peak_augment_ratio = cfg.get("peak_augment_ratio", 0.3)
     peak_threshold_ratio = cfg.get("peak_threshold_ratio", 0.7)
     if peak_augment_ratio > 0 and len(X_train) > 0:
-        X_train, Y_train, Xf_train = augment_peak_samples(
-            X_train, Y_train, Xf_train,
+        X_train, Y_train = augment_peak_samples(
+            X_train, Y_train,
             peak_threshold_ratio=peak_threshold_ratio,
             peak_augment_ratio=peak_augment_ratio
         )
@@ -540,32 +422,31 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     else:
         test_starts = None
 
-    # 目标通道在 feature_cols 中的下标 (Total_Flow); 回灌时覆盖该通道
-    target_feat_idx = processor.feature_cols.index(processor.target_cols[0])
-
     print(f"  {cfg['resample_freq']}频率: lookback={lookback_steps}步, predict={predict_steps}步"
-          f" (单步自回归滚动 {predict_steps} 次)")
-    print(f"  target_feat_idx={target_feat_idx} ({processor.target_cols[0]})")
-    print(f"  X_train={X_train.shape}, Y_train={Y_train.shape}, Xf_train={Xf_train.shape}")
-    print(f"  X_test={X_test.shape}, Y_test={Y_test.shape}, Xf_test={Xf_test.shape}")
+          f" (直接多步, 一次 forward 出 {predict_steps} 步)")
+    print(f"  X_train={X_train.shape}, Y_train={Y_train.shape}")
+    print(f"  X_test={X_test.shape}, Y_test={Y_test.shape}")
 
     if len(X_train) == 0 or len(X_test) == 0:
         print(f"  ⚠ 样本数为0，跳过此配置")
         return None
 
-    train_loader = DataLoader(ARSeqDataset(X_train, Y_train, Xf_train),
+    train_loader = DataLoader(SeqDataset(X_train, Y_train),
                               batch_size=cfg["batch_size"], shuffle=True,
                               pin_memory=True, num_workers=2)
-    test_loader = DataLoader(ARSeqDataset(X_test, Y_test, Xf_test),
-                            batch_size=cfg["batch_size"], shuffle=False,
-                            pin_memory=True, num_workers=2)
+    test_loader = DataLoader(SeqDataset(X_test, Y_test),
+                             batch_size=cfg["batch_size"], shuffle=False,
+                             pin_memory=True, num_workers=2)
 
-    # ── 模型工厂: horizon=1 (单步头), 自回归 rollout 负责滚出 horizon ──
+    # 目标通道在 feature_cols 中的下标 (iTransformer 需要)
+    target_feat_idx = processor.feature_cols.index(processor.target_cols[0])
+
+    # ── 模型工厂: horizon=predict_steps (直接多步头, 一次出整段 horizon) ──
     model_type = cfg.get("model_type", "transformer")
     common_model_kwargs = dict(
         input_dim=X_train.shape[2],
         output_dim=1,
-        horizon=1,                       # ← 单步头: 只预测下一个点
+        horizon=predict_steps,           # ← 直接多步头: 一次输出整个 horizon
         input_len=lookback_steps,
         d_model=cfg["d_model"],
         nhead=cfg["nhead"],
@@ -608,7 +489,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     scaler = GradScaler(enabled=use_amp)
     eval_interval = cfg.get("eval_interval", 1)
 
-    print(f"\n  Training(自回归): {label}")
+    print(f"\n  Training(直接多步): {label}")
     print(f"  AMP={'ON' if use_amp else 'OFF'}, eval_interval={eval_interval}")
 
     epoch_pbar = tqdm(range(1, cfg["epochs"] + 1), desc="Epochs", unit="epoch")
@@ -618,17 +499,15 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
 
         batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg['epochs']}",
                           unit="batch", leave=False)
-        for batch_x, batch_y, batch_xf in batch_pbar:
+        for batch_x, batch_y in batch_pbar:
             batch_x = batch_x.to(device, non_blocking=True)
             batch_y = batch_y.to(device, non_blocking=True)
-            batch_xf = batch_xf.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
             # AMP: forward 用 float16, backward 用 float16 + 缩放
             with autocast(enabled=use_amp):
-                pred = autoregressive_rollout(model, batch_x, batch_xf, predict_steps,
-                                             target_feat_idx, detach_feedback)
+                pred = model(batch_x, target_len=predict_steps)   # 一次出全段
                 loss = weighted_mse_loss(pred, batch_y)
 
             scaler.scale(loss).backward()
@@ -645,8 +524,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         # 按 eval_interval 频率评估测试集
         do_eval = (epoch % eval_interval == 0) or (epoch == cfg["epochs"])
         if do_eval:
-            test_metrics = evaluate(model, test_loader, device, processor, predict_steps,
-                                    target_feat_idx, detach_feedback)
+            test_metrics = evaluate(model, test_loader, device, processor, predict_steps)
 
         test_loss = test_metrics.get("loss", float("nan"))
         current_mape = test_metrics.get("flow_mape", float("inf"))
@@ -688,7 +566,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # 保存 scaler / 特征列 / 配置 (供推理脚本加载; 自回归推理需配套 rollout)
+    # 保存 scaler / 特征列 / 配置 (供推理脚本加载; 直接多步推理)
     scaler_path = os.path.join(result_dir, "scaler.pkl")
     with open(scaler_path, "wb") as f:
         pickle.dump({
@@ -697,20 +575,17 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
             "target_scaler": processor.target_scaler,
             "feature_cols": processor.feature_cols,
             "target_cols": processor.target_cols,
-            # 自回归推理需要: 单步头 (horizon=1) + 与训练一致的 rollout
-            "autoregressive": True,
+            # 直接多步推理: horizon=predict_steps 一次输出, 无需 rollout
+            "autoregressive": False,
             "target_feat_idx": target_feat_idx,
-            "detach_feedback": detach_feedback,
         }, f)
     print(f"  推理用 scaler/特征配置已保存: {scaler_path}")
-    print(f"  ⚠ 注意: 本模型为单步自回归, 推理须用配套的 autoregressive_rollout "
-          f"(见 train_transformer_autoregressive.py), 不能用原直接多步推理脚本")
+    print(f"  ⚠ 注意: 本模型为直接多步, 推理用 model(x, target_len=predict_steps) "
+          f"一次出整段, 不能用自回归 rollout 推理脚本")
 
     # 最终评估
-    train_metrics = evaluate(model, train_loader, device, processor, predict_steps,
-                             target_feat_idx, detach_feedback)
-    test_metrics = evaluate(model, test_loader, device, processor, predict_steps,
-                            target_feat_idx, detach_feedback)
+    train_metrics = evaluate(model, train_loader, device, processor, predict_steps)
+    test_metrics = evaluate(model, test_loader, device, processor, predict_steps)
 
     print(f"\n  最终结果:")
     print(f"  Train: Loss={train_metrics['loss']:.6f}, MAE={train_metrics['flow_mae']:.2f}, "
@@ -723,7 +598,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
           f"Test 保留 {test_metrics['mape_n_used']}/{test_metrics['mape_n_total']})")
 
     with open(os.path.join(result_dir, "metrics.txt"), "w", encoding="utf-8") as f:
-        f.write(f"[自回归单步版] detach_feedback={detach_feedback}, predict_steps={predict_steps}\n")
+        f.write(f"[直接多步版] predict_steps={predict_steps}\n")
         for name, m in [("Train", train_metrics), ("Test", test_metrics)]:
             f.write(f"{name}: Loss={m['loss']:.6f}, MAE={m['flow_mae']:.2f}, "
                     f"RMSE={m['flow_rmse']:.2f}, MAPE={m['flow_mape']:.2f}%\n")
@@ -752,7 +627,7 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
     plt.plot(history_df["epoch"], history_df["train_loss"], label="Train Loss")
     plt.plot(history_df["epoch"], history_df["test_loss"], label="Test Loss")
     plt.xlabel("Epoch"); plt.ylabel("Loss")
-    plt.title(f"Training Curve (Autoregressive) — {label}")
+    plt.title(f"Training Curve (Direct Multi-step) — {label}")
     plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
     plt.savefig(os.path.join(result_dir, "loss_curve.png"), dpi=200, bbox_inches="tight")
     plt.close()
@@ -768,7 +643,6 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
         "lookback_days": lookback,
         "predict_days": predict,
         "predict_steps": predict_steps,
-        "detach_feedback": detach_feedback,
         "n_train_samples": len(X_train),
         "n_test_samples": len(X_test),
         "best_epoch": int(history_df.loc[history_df["flow_mape"].idxmin(), "epoch"]),
@@ -786,19 +660,13 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
 # ==================== 主入口 ====================
 
 def main():
-    parser = argparse.ArgumentParser(description="训练单步自回归 Transformer / iTransformer 流量预测模型")
+    parser = argparse.ArgumentParser(description="训练直接多步 (非自回归) Transformer / iTransformer 流量预测模型")
     parser.add_argument("--model", choices=["transformer", "itransformer"], default=None,
                         help="模型类型 (默认 None = 用 BASE_CONFIG['model_type'])")
     parser.add_argument("--label", default=None,
                         help="结果子目录名 (默认 None = 用 BASE_CONFIG['label'])")
     parser.add_argument("--lookback", type=float, default=None,
-                        help="回看天数 (默认 None = 用 BASE_CONFIG['lookback_days']; 最优基线为 14 天)")
-    # --detach-feedback / --no-detach-feedback: 切换回灌预测值是否 detach
-    #   默认 (detach_feedback=True): 回灌 detach, 梯度只训练当前步 (稳定省显存)
-    #   --no-detach-feedback: 完整 BPTT, 梯度穿过整条 rollout 链 (显存按 horizon 倍增)
-    parser.add_argument("--detach-feedback", dest="detach_feedback",
-                        action=argparse.BooleanOptionalAction, default=None,
-                        help="回灌预测是否 detach (默认 True; --no-detach-feedback=完整BPTT)")
+                        help="回看天数 (默认 None = 用 BASE_CONFIG['lookback_days'])")
     args = parser.parse_args()
 
     config = dict(BASE_CONFIG)
@@ -808,14 +676,12 @@ def main():
         config["label"] = args.label
     if args.lookback is not None:
         config["lookback_days"] = args.lookback
-    if args.detach_feedback is not None:
-        config["detach_feedback"] = args.detach_feedback
     set_seed(config["seed"])
 
     device = torch.device(config["device"])
     print(f"Device: {device}")
     print(f"结果目录: {os.path.join(config['base_result_dir'], config['label'])}")
-    print(f"模式: 单步自回归 (horizon=1 head + 滚动 rollout, detach_feedback={config.get('detach_feedback', True)})")
+    print(f"模式: 直接多步 (horizon=predict_steps head, 一次 forward 出全段, 无 rollout)")
 
     # ============ 第一步: 数据加载 & 清洗 (特征工程已删除) ============
     print("\n" + "=" * 80)

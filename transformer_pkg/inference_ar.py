@@ -34,7 +34,7 @@ from data_processing import DataProcessor
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA = r"D:\Junshan_Project\data\水厂2025年小时级汇总.csv"
 DEFAULT_RESULT_DIR = os.path.join(HERE, "results",
-                                  "junshan_L1D_P24H_1h_itransformer_autoregressive_test")
+                                  "junshan_L1D_P24H_1h_transformer_autoregressive_20260828_141342")
 
 # 分时压力默认参数
 DEFAULT_PRESSURE_SCHEDULE = [
@@ -211,48 +211,71 @@ class FlowPredictor:
         df = df.sort_index()
         print(f"[predict] 输入: {df.index.min()} ~ {df.index.max()}, {len(df)} 行")
 
-        # ① 清洗 + 日历特征 (与训练完全一致: build_base_features → clean_and_resample)
+        # ① 清洗 + 日历 + 数据驱动特征 (与训练 build_feature_table 完全一致)
         df_base = self.processor.build_base_features(df)
         df_clean = self.processor.clean_and_resample(df_base)
         df_clean = self._fill_day_gaps(df_clean)
         df_feat = self.processor.add_calendar_features(df_clean)
+        df_feat = self.processor.add_data_driven_features(df_feat)
 
         # 特征列校验
         missing = [c for c in self.feature_cols if c not in df_feat.columns]
         if missing:
             raise ValueError(f"特征列缺失 (训练与推理不匹配): {missing}")
 
-        df_feat = df_feat[self.feature_cols]
+        df_feat = df_feat[self.feature_cols].dropna()
         if len(df_feat) < self.lookback_steps:
             raise ValueError(
-                f"清洗后仅 {len(df_feat)} 行, 不足 lookback={self.lookback_steps} 步")
-        print(f"[predict] 清洗后: {len(df_feat)} 行, 特征数={len(self.feature_cols)}")
+                f"清洗+dropna 后仅 {len(df_feat)} 行, 不足 lookback={self.lookback_steps} 步 "
+                f"(数据驱动特征需 ≥22 天历史; 推荐 ≥30 天)")
+        print(f"[predict] 清洗+dropna 后: {len(df_feat)} 行, 特征数={len(self.feature_cols)}")
 
         # ② 取最后 lookback_steps 行, 缩放
         window_feat = df_feat.iloc[-self.lookback_steps:]
         X = self.feature_scaler.transform(window_feat.values.astype(np.float32))
         window = torch.from_numpy(X).unsqueeze(0).to(self.device)  # (1, L, C)
+        last_hist_row = window_feat.iloc[-1]   # 未来行特征兜底 (理论不触发)
 
-        # ③ 未来特征行 (日历真值 + 目标通道占位)
+        # ③ 未来时间轴 + 在线特征重建的扩展表 (历史flow + 未来占位)
+        # 数据驱动特征已无泄露 (基准=flow[t-1]), 未来行的 lag/rolling/zscore 依赖
+        # "已生成的预测", 故每步把预测回灌成*原始流量*重算, 与训练 Xf 口径一致。
         last_ts = df_clean.index[-1]
         future_idx = pd.date_range(
             start=last_ts + pd.Timedelta(minutes=self.freq_minutes),
             periods=self.predict_steps, freq=self.resample_freq)
-        future_feat_raw = self.processor.add_calendar_features(
-            pd.DataFrame(index=future_idx))
-        future_feat_raw[self.target_cols[0]] = 0.0
-        future_feat_scaled = self.feature_scaler.transform(
-            future_feat_raw[self.feature_cols].values.astype(np.float32))
+        target_col = self.target_cols[0]
+        # 扩展表: 取最近 800 行历史 (覆盖 30 天滚动窗 720 + 余量) + 未来行 (flow=NaN)
+        n_hist_ext = min(len(df_clean), 800)
+        hist_ext = self.processor.add_calendar_features(
+            df_clean[[target_col]].iloc[-n_hist_ext:].copy())
+        fut_ext = self.processor.add_calendar_features(
+            pd.DataFrame({target_col: np.nan}, index=future_idx))
+        ext = pd.concat([hist_ext, fut_ext])   # 列: target_col + 日历; 未来 flow=NaN
 
-        # ④ 自回归 rollout (与训练 autoregressive_rollout 一致)
+        # ④ 自回归 rollout (与训练 autoregressive_rollout 一致: 目标通道用预测覆盖)
         preds_scaled = []
         with torch.no_grad():
             for k in range(self.predict_steps):
-                one = self.model(window, target_len=1)          # (1, 1, 1)
+                # 重算数据驱动特征 (ext 里已填入 t<k 的预测 → lag/rolling 用到它们)
+                feat_ext = self.processor.add_data_driven_features(ext)
+                row = feat_ext.loc[future_idx[k], self.feature_cols].astype(np.float32)
+                if row.isna().any():                       # 兜底: 边缘 min_periods 缺值
+                    row = row.fillna(last_hist_row)
+                row_scaled = self.feature_scaler.transform(
+                    row.values.reshape(1, -1))[0].astype(np.float32)
+
+                one = self.model(window, target_len=1)     # (1, 1, 1)
                 pred_val = float(one[0, 0, 0].cpu())
                 preds_scaled.append(pred_val)
 
-                next_row = future_feat_scaled[k].copy()
+                # 预测回灌 ext (转原始流量域, 因 data-driven 在原始域计算;
+                #   feature_scaler 对 Total_Flow 的缩放与 target_scaler 一致)
+                pred_orig = float(self.processor.target_scaler.inverse_transform(
+                    np.array([[pred_val]], dtype=np.float64))[0, 0])
+                ext.loc[future_idx[k], target_col] = pred_orig
+
+                # 滑窗: 末尾拼 future 行, 目标通道用 scaled 预测覆盖 (与训练一致)
+                next_row = row_scaled.copy()
                 next_row[self.target_feat_idx] = pred_val
                 next_row_t = torch.from_numpy(
                     next_row.astype(np.float32)).view(1, 1, -1).to(self.device)
