@@ -212,7 +212,7 @@ print(f"训练集: {len(y_train)} 样本, 测试集: {len(y_test)} 样本")
 
 # ── 4. 加载 TimesFM 模型 ──
 CONTEXT_LEN = 336   # 回看 14 天 (336 小时) - 参数搜索最优
-HORIZON = 1         # 每次预测 1 步 = 1 小时 - MAPE 最优 5.66%
+HORIZON = 24         # 每次预测 1 步 = 1 小时 - MAPE 最优 5.66%
 
 model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
     r"D:\Junshan_Project\models\timesfm-2.5-200m-pytorch",

@@ -32,7 +32,7 @@ from itransformer_model import iTransformer
 from data_processing import DataProcessor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DATA = r"D:\Junshan_Project\data\水厂2025年小时级汇总.csv"
+DEFAULT_DATA = r"D:\Junshan_Project\transformer_pkg\input.csv"
 DEFAULT_RESULT_DIR = os.path.join(HERE, "results",
                                   "junshan_L1D_P24H_1h_transformer_autoregressive_20260828_141342")
 
