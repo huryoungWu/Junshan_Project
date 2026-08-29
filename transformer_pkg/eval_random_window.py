@@ -66,7 +66,7 @@ from train_transformer_autoregressive import autoregressive_rollout, compute_map
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA = r"D:\Junshan_Project\data\水厂2025年小时级汇总.csv"
 DEFAULT_RESULT_DIR = os.path.join(HERE, "results",
-                                  "junshan_L1D_P24H_1h_transformer_autoregressive_20260824_234455")
+                                  "junshan_L1D_P24H_1h_transformer_autoregressive_20260828_143855")
 
 
 def calc_metrics(y_true, y_pred, floor_ratio=0.1):
