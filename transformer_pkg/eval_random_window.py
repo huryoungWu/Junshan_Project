@@ -94,6 +94,8 @@ def main():
                         help="逐日画图并保存到本地")
     parser.add_argument("--plot_dir", default=None,
                         help="逐日图片保存目录 (默认: result_dir/daily_plots)")
+    parser.add_argument("--test_data", default=None,
+                        help="独立测试集 CSV (默认: 从训练配置的 file_path 按时间切分)")
     parser.add_argument("--encoding", default="utf-8-sig", help="CSV 编码")
     parser.add_argument("--lookback", type=float, default=None,
                         help="回看天数 (默认: 训练配置; 模型 input_len 固定, 传值必须等于训练配置)")
@@ -130,6 +132,12 @@ def main():
         config = dict(config)
         config["file_path"] = args.data
         print(f"数据文件: {args.data} (覆盖训练配置, 其余管线不变)")
+
+    # --test_data: 指定独立测试集文件, build_feature_table 将分别加载训练/测试文件
+    if args.test_data is not None:
+        config = dict(config)
+        config["test_file_path"] = args.test_data
+        print(f"独立测试集: {args.test_data}")
 
     if args.lookback is not None and args.lookback != config["lookback_days"]:
         raise SystemExit(f"错误: --lookback {args.lookback} != 训练配置 lookback_days="
@@ -199,6 +207,7 @@ def main():
     model.eval()
 
     # ── 确定预测起点 (第一个预测时刻) ──
+    has_test_file = "test_file_path" in config
     if args.start_date is not None:
         target_date = pd.Timestamp(args.start_date)
         mask = df_all_feat.index >= target_date
@@ -207,6 +216,11 @@ def main():
             return
         first_pred_idx = int(np.where(mask)[0][0])
         print(f"起始日期: {args.start_date}")
+    elif has_test_file:
+        # 有独立测试集时, 默认从测试集起点开始 (需回看 lookback 天)
+        first_pred_idx = test_start_row + lookback_steps
+        print(f"独立测试集: 默认从测试集起点开始 "
+              f"({pd.Timestamp(ts_all[first_pred_idx]).date()})")
     else:
         if total_len <= predict_steps:
             print("数据不足")

@@ -366,6 +366,22 @@ class DataProcessor:
         out["Total_Flow"] = df["Total_Flow"].astype(np.float32)
         return out
 
+    def load_and_clean_file(self, file_path):
+        """加载并清洗单个数据文件, 返回清洗后的 DataFrame (DatetimeIndex + Total_Flow)。
+
+        复用 load_raw / build_base_features / clean_and_resample 的已有逻辑,
+        但接受任意文件路径 (不依赖 self.config["file_path"])。
+        """
+        orig_path = self.config["file_path"]
+        self.config["file_path"] = file_path
+        try:
+            df_raw = self.load_raw()
+            df_base = self.build_base_features(df_raw)
+            df_clean = self.clean_and_resample(df_base)
+        finally:
+            self.config["file_path"] = orig_path
+        return df_clean
+
     def clean_and_resample(self, df):
         """突变修正 + Hampel 清洗 + 流量物理界限裁剪 → 重采样 (60min, 已是整点
         → 恒等) → 删空 bin。
@@ -482,20 +498,36 @@ class DataProcessor:
         return res
 
     def build_feature_table(self):
-        df_raw = self.load_raw()
-        df_base = self.build_base_features(df_raw)
+        test_file_path = self.config.get("test_file_path")
 
-        # 先按时间切分, 再分别清洗: 清洗不跨越训练/测试边界。
-        test_days = self.config.get("test_days", 15)
-        test_start = df_base.index[-1] - pd.Timedelta(days=test_days)
-        df_base_train = df_base.loc[df_base.index <= test_start].copy()
-        df_base_test = df_base.loc[df_base.index > test_start].copy()
-        print(f"  清洗分段: 训练段 {df_base_train.index.min()} ~ {df_base_train.index.max()} "
-              f"({len(df_base_train)} 行), 测试段 {df_base_test.index.min()} ~ {df_base_test.index.max()} "
-              f"({len(df_base_test)} 行), 分段清洗互不跨界")
+        if test_file_path:
+            # 分别加载训练/测试文件, 各自独立清洗
+            print(f"  加载训练文件: {self.config['file_path']}")
+            df_clean_train = self.load_and_clean_file(self.config["file_path"])
+            print(f"  训练数据清洗后: {df_clean_train.index.min()} ~ {df_clean_train.index.max()} "
+                  f"({len(df_clean_train)} 行)")
 
-        df_clean = pd.concat([self.clean_and_resample(df_base_train),
-                              self.clean_and_resample(df_base_test)])
+            print(f"  加载测试文件: {test_file_path}")
+            df_clean_test = self.load_and_clean_file(test_file_path)
+            print(f"  测试数据清洗后: {df_clean_test.index.min()} ~ {df_clean_test.index.max()} "
+                  f"({len(df_clean_test)} 行)")
+
+            df_clean = pd.concat([df_clean_train, df_clean_test])
+        else:
+            # 原有逻辑: 单文件, 按时间切分后分别清洗
+            df_raw = self.load_raw()
+            df_base = self.build_base_features(df_raw)
+
+            test_days = self.config.get("test_days", 15)
+            test_start = df_base.index[-1] - pd.Timedelta(days=test_days)
+            df_base_train = df_base.loc[df_base.index <= test_start].copy()
+            df_base_test = df_base.loc[df_base.index > test_start].copy()
+            print(f"  清洗分段: 训练段 {df_base_train.index.min()} ~ {df_base_train.index.max()} "
+                  f"({len(df_base_train)} 行), 测试段 {df_base_test.index.min()} ~ {df_base_test.index.max()} "
+                  f"({len(df_base_test)} 行), 分段清洗互不跨界")
+
+            df_clean = pd.concat([self.clean_and_resample(df_base_train),
+                                  self.clean_and_resample(df_base_test)])
 
         # 日历特征 + 数据驱动特征: 由时间索引 + 历史流量确定性生成, 训练/推理共用。
         df_feat = self.add_calendar_features(df_clean)
