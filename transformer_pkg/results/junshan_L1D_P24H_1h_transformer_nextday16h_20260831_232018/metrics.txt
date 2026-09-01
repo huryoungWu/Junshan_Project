@@ -1,4 +1,0 @@
-[自回归单步版, 每天16点预测次日] lookback=7d+16h, stride=24, detach_feedback=True, predict_steps=24
-Train: Loss=0.076068, MAE=187.18, RMSE=263.57, MAPE=5.96%
-Test: Loss=0.068711, MAE=181.33, RMSE=250.50, MAPE=6.00%
-MAPE 过滤: 排除 |true| < 10% * max|true| 的点 (Train 保留 20538/20544 点, Test 保留 1968/1968 点)

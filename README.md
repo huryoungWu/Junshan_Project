@@ -1,417 +1,232 @@
-# 军山水厂流量预测项目 (Junshan Water Plant Flow Prediction)
+# 军山水厂流量预测 (简化版)
 
-> 基于 Transformer / iTransformer 的出厂水流量小时级预测系统，采用单步自回归滚动预测架构，支持日历特征增强与残差修正。
-
-## 项目概述
-
-本项目针对武汉军山水厂的出厂水流量进行小时级预测，采用深度学习 Transformer 架构，通过自回归滚动方式预测未来 24 小时流量。项目包含完整的数据处理、模型训练、评估与推理流程。
-
-### 核心特性
-
-- **双模型架构**：支持标准 Transformer 和 iTransformer（变量即 token）两种模型
-- **自回归预测**：单步预测头 + 滚动 rollout，缓解 exposure bias
-- **丰富特征工程**：日历特征（12 维）+ 数据驱动特征（17 维）+ 流量本身
-- **多尺度周期编码**：小时/星期/月份/年日的 sin/cos 编码，平滑周期边界
-- **中国节假日感知**：集成 chinese-calendar 包，区分法定假日与调休
-- **稳健数据清洗**：突变检测 + Hampel 离群过滤 + 物理界限裁剪
-- **峰值样本增强**：对高峰时段样本上采样，提升峰值预测精度
-
-## 项目结构
-
-```
-Junshan_Project/
-├── transformer_pkg/                  # 核心模型包
-│   ├── __init__.py                   # 包初始化
-│   ├── transformer_model.py          # TimeSeriesTransformer 模型定义
-│   ├── itransformer_model.py         # iTransformer 模型定义
-│   ├── data_processing.py            # 数据清洗与特征工程
-│   ├── train_transformer_autoregressive.py  # 自回归训练脚本
-│   ├── eval_random_window.py         # 指定窗口评估（与训练同口径）
-│   ├── eval_rolling_mape.py          # 滚动窗口 MAPE 评估
-│   ├── eval_rolling_ar.py            # 自回归滚动评估
-│   ├── inference_transformer.py      # 直接多步推理
-│   ├── inference_ar.py               # 自回归推理
-│   └── results/                      # 训练结果目录
-│       └── junshan_L1D_P24H_1h_transformer_autoregressive_*/
-│           ├── best_seq2seq_model.pth  # 最优模型权重
-│           ├── scaler.pkl              # 归一化器与配置
-│           ├── metrics.txt             # 评估指标
-│           ├── train_history.csv       # 训练历史
-│           ├── loss_curve.png          # 损失曲线
-│           └── daily_plots/            # 逐日预测图
-├── data/                             # 数据目录
-│   ├── 水厂2025年小时级汇总.csv       # 合并后的 2025 年小时级数据
-│   ├── 出厂水流量（2025-01-01至2026-01-01).xlsx
-│   ├── 出厂水压力2025.xlsx
-│   ├── 送水泵运行频率2025.xlsx
-│   ├── 送水泵运行状态2025.xlsx
-│   ├── 武汉军山 流量_2024-01-01至2025-01-01.xlsx
-│   ├── merge_data.py                 # 数据合并脚本
-│   └── merge_2024_2025.py            # 2024-2025 数据合并
-├── plots/                            # 逐日预测图（2025-10 ~ 2025-12）
-├── flow_plots/                       # 流量分析图
-├── analyze_flow.py                   # 流量与压力数据分析
-├── residual_correction_compare.py    # 残差修正方法对比
-├── residual_correction_comparison.png # 残差修正对比图
-├── monthly_total_flow_2024_2025.png  # 月度流量汇总图
-├── prediction_ar.csv                 # 自回归预测结果
-├── timeseries_transformer_optimization.md  # Transformer 优化方案文档
-├── requirements.txt                  # Python 依赖
-├── run.bat                           # Windows 训练启动脚本
-└── README.md                         # 本文件
-```
-
-## 模型架构
-
-### 1. TimeSeriesTransformer
-
-标准 Transformer Encoder 架构：
-
-```
-输入 (B, L, C) → 特征投影 → 正弦位置编码 → N 层 Transformer Encoder → 取最后时刻 → 线性输出头
-```
-
-- **特征投影**：`Linear(input_dim → d_model)`
-- **位置编码**：正弦绝对位置编码（与窗口长度解耦）
-- **编码器**：N 层 `nn.TransformerEncoder`，多头自注意力
-- **输出头**：`Linear(d_model → horizon * output_dim)`
-
-### 2. iTransformer
-
-变量即 token 的 Transformer（Liu et al., ICLR 2024）：
-
-```
-输入 (B, L, C) → RevIN 实例归一化 → 转置 (B, C, L) → 共享 Linear(L → d_model) → N 层 Encoder → 输出头 → RevIN 反归一化
-```
-
-- **RevIN**：可逆实例归一化，逐通道均值/方差归一化
-- **变量位置编码**：可学习的变量位置嵌入
-- **跨变量注意力**：对变量维度做自注意力，捕捉变量间关系
-
-### 自回归预测模式
-
-```python
-# 单步预测头 (horizon=1) + 滚动 rollout
-for k in range(predict_steps):
-    pred = model(window, target_len=1)      # 预测下一个点
-    next_row = future_features[k].copy()
-    next_row[target_idx] = pred             # 回灌预测值
-    window = cat([window[1:], next_row])    # 滑窗前进
-```
-
-## 数据处理
-
-### 数据源
-
-- **时间范围**：2024-01-01 ~ 2025-12-31（约 17,520 小时）
-- **采样频率**：60 分钟（整点）
-- **主要特征**：出厂水流量（m³/h）
-- **辅助特征**：出厂水压力、泵运行频率、泵运行状态
-
-### 数据清洗流程
-
-1. **突变流量插值修正**：日内（t±1h）/ 跨日（t±24h）双判据
-2. **Hampel 离群过滤**：滚动中位数 + MAD 稳健离群检测（窗口 48h）
-3. **物理界限裁剪**：流量范围 [0, 10000] m³/h
-4. **重采样**：60 分钟整点，空 bin 保持 NaN 不虚构
-
-### 特征工程
-
-#### 日历特征（12 维）
-
-| 特征 | 说明 | 周期 |
-|------|------|------|
-| `hour_sin`, `hour_cos` | 小时相位编码 | 24h |
-| `dow_sin`, `dow_cos` | 星期几编码 | 7 天 |
-| `month_sin`, `month_cos` | 月份编码 | 12 月 |
-| `doy_sin`, `doy_cos` | 年日序号编码 | 365 天 |
-| `is_workday` | 调休感知工作日 | - |
-| `is_holiday` | 法定假日 | - |
-| `holiday_eve` | 假期前一天 | - |
-| `holiday_next` | 假期后一天 | - |
-
-#### 数据驱动特征（17 维）
-
-| 类别 | 特征 | 说明 |
-|------|------|------|
-| 滞后 | `lag_24h`, `lag_168h` | 昨天/上周同时段流量 |
-| 滞后变化 | `lag_24h_diff`, `lag_24h_ratio` | 日变化量/比率 |
-| 滚动统计 | `roll_mean_3d/7d/30d` | 多尺度均值 |
-| 滚动统计 | `roll_std_7d`, `roll_max/min_7d`, `roll_median_48h` | 波动/极值 |
-| 日内形状 | `day_avg`, `day_peak_amp` | 日均值、峰谷幅度 |
-| 高峰比例 | `morning/evening/night_ratio` | 早晚高峰/夜间比例 |
-| 偏离 | `flow_zscore_7d/30d` | Z-score 偏离程度 |
+基于 Transformer 模型的出厂水流量预测，每天 16 点预测次日全天 24 小时流量。
 
 ## 快速开始
 
-### 环境要求
-
-- Python 3.9+
-- PyTorch 2.0+
-- CUDA（可选，推荐 GPU 训练）
-
-### 安装依赖
-
 ```bash
-pip install -r requirements.txt
+# 使用默认 CSV 文件预测
+python junshan_inference.py
+
+# 指定输入 CSV 文件
+python junshan_inference.py --data path/to/your_data.csv
+
+# 指定输出 JSON 文件
+python junshan_inference.py --data path/to/your_data.csv --output pred.json
 ```
 
-主要依赖：
-```
-numpy>=1.24
-pandas>=2.0
-torch>=2.0
-scikit-learn>=1.3
-matplotlib>=3.7
-tqdm>=4.60
-taospy>=2.8.10
-pyarrow>=14
-chinese-calendar  # 可选，用于中国节假日特征
-```
+## 输入要求
 
-### 数据准备
+### CSV 文件格式
 
-1. 将原始 Excel 文件放入 `data/` 目录
-2. 运行数据合并脚本：
+CSV 文件必须包含以下两列：
 
-```bash
-cd data
-python merge_data.py
-```
+| 列名 | 说明 | 示例 |
+|------|------|------|
+| `时间` | 时间戳，格式 `YYYY-MM-DD HH:MM:SS` | `2025-08-20 15:00:00` |
+| `出厂水流量` | 流量值，单位 m³/h | `3843.86` |
 
-生成 `水厂2025年小时级汇总.csv`
-
-### 模型训练
-
-#### 方式一：使用启动脚本（Windows）
-
-```bash
-run.bat
+**CSV 文件示例：**
+```csv
+时间,出厂水流量
+2025-07-17 00:00:00,2262.91
+2025-07-17 01:00:00,1823.1
+2025-07-17 02:00:00,1832.14
+2025-07-17 03:00:00,1857.82
+...
+2025-08-20 15:00:00,3843.86
 ```
 
-#### 方式二：命令行训练
+### 数据时间范围
 
-```bash
-cd transformer_pkg
+- **数据粒度**：小时级（每小时一条记录）
+- **最少数据量**：约 16 天（363 小时）
+  - 回看窗口：184 小时（7 天 + 16 小时）
+  - 滚动特征预热：180 小时（30 天滚动窗口）
+- **推荐数据量**：≥ 35 天（满窗 + 清洗余量）
+- **截止时刻**：最后一条数据应为某天 15:00（标准 16 点截止）
+  - 预测目标 = 截止日次日（0:00~23:00，共 24 小时）
 
-# 训练 Transformer 自回归模型
-python train_transformer_autoregressive.py
+**参考文件：**
+- 输入示例：`data/input_nextday16h_20250820_35d.csv`
+  - 时间范围：2025-07-17 00:00 ~ 2025-08-20 15:00
+  - 数据量：832 条（约 34.7 天）
+  - 预测目标：2025-08-21（次日全天）
 
-# 指定模型类型
-python train_transformer_autoregressive.py --model transformer
-python train_transformer_autoregressive.py --model itransformer
+## 输出格式
 
-# 自定义参数
-python train_transformer_autoregressive.py --lookback 14 --label my_experiment
-```
+### JSON 输出结构
 
-### 模型评估
-
-```bash
-cd transformer_pkg
-
-# 指定窗口评估（与训练同口径）
-python eval_random_window.py --start_date 2025-10-03 --all_days
-
-# 指定日期范围 + 逐日画图
-python eval_random_window.py --start_date 2025-10-03 --end_date 2025-12-31 --plot
-
-# 滚动窗口 MAPE 评估
-python eval_rolling_mape.py --data ../data/水厂2025年小时级汇总.csv
-```
-
-### 模型推理
-
-```bash
-cd transformer_pkg
-
-# 直接多步推理
-python inference_transformer.py --data input.csv
-
-# 自回归推理
-python inference_ar.py --data input.csv --with_pressure
-```
-
-#### 程序接口
-
-```python
-from inference_ar import FlowPredictor
-
-# 加载模型
-predictor = FlowPredictor("results/junshan_L1D_P24H_1h_transformer_autoregressive_20260824_234455")
-
-# 方式 1: CSV 文件
-pred = predictor.predict("input.csv")
-
-# 方式 2: DataFrame
-import pandas as pd
-df = pd.read_csv("input.csv")
-pred = predictor.predict(df)
-
-# 方式 3: 字典列表
-rows = [{"时间": "2025-07-15 06:00:00", "出厂水流量": 1621.6}, ...]
-pred = predictor.predict(rows)
-
-# 获取压力预测
-pred_with_pressure = predictor.predict_pressure(pred)
-```
-
-## 训练配置
-
-### 默认超参数
-
-```python
-BASE_CONFIG = {
-    # 数据
-    "file_path": "data/水厂2025年小时级汇总.csv",
-    "resample_freq": "60min",
-    "stride": 1,
-    "lookback_days": 7,
-    "predict_days": 1.0,
-    "test_days": 90,
-
-    # Transformer 架构
-    "d_model": 32,
-    "nhead": 4,
-    "num_layers": 3,
-    "dim_feedforward": 256,
-    "transformer_dropout": 0.2,
-    "model_type": "transformer",  # transformer | itransformer
-
-    # 自回归
-    "detach_feedback": True,
-
-    # 训练
-    "batch_size": 16,
-    "epochs": 40,
-    "learning_rate": 5e-4,
-    "weight_decay": 1e-4,
-    "patience": 10,
-
-    # 峰值增强
-    "peak_augment_ratio": 0.3,
-    "peak_threshold_ratio": 0.7,
+```json
+{
+  "date": "2025-08-21",
+  "provider": "junshan_transformer_nextday16h",
+  "unit": "m3/h",
+  "interval_minutes": 60,
+  "horizon": 24,
+  "values": [2093.0, 1860.0, 1665.0, 1580.0, 1520.0, 1480.0, 1450.0, 1520.0, 1680.0, 1950.0, 2280.0, 2520.0, 2680.0, 2750.0, 2820.0, 2900.0, 3050.0, 3180.0, 3250.0, 3100.0, 2850.0, 2520.0, 2280.0, 2150.0]
 }
 ```
 
-### 关键参数说明
+### 字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `date` | string | 预测目标日期，格式 `YYYY-MM-DD` |
+| `provider` | string | 模型标识，如 `junshan_transformer_nextday16h` |
+| `unit` | string | 流量单位，固定为 `m3/h`（立方米/小时） |
+| `interval_minutes` | int | 预测间隔，固定为 `60`（每小时） |
+| `horizon` | int | 预测时长，固定为 `24`（全天 24 小时） |
+| `values` | array | 24 个浮点数，分别对应 0:00~23:00 的预测流量 |
+
+### values 数组索引对应
+
+| 索引 | 时刻 | 说明 |
+|------|------|------|
+| 0 | 00:00 | 凌晨 |
+| 1 | 01:00 | |
+| ... | ... | |
+| 11 | 11:00 | 上午 |
+| 12 | 12:00 | 中午 |
+| ... | ... | |
+| 15 | 15:00 | 下午（截止时刻） |
+| ... | ... | |
+| 23 | 23:00 | 晚上 |
+
+## 命令行参数
+
+```bash
+python junshan_inference.py [OPTIONS]
+```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `lookback_days` | 7 | 回看天数（输入窗口长度） |
-| `predict_days` | 1.0 | 预测天数（24 小时） |
-| `d_model` | 32 | Transformer 隐维度 |
-| `nhead` | 4 | 注意力头数 |
-| `num_layers` | 3 | Encoder 层数 |
-| `detach_feedback` | True | 回灌预测值是否 detach（True=稳定省显存） |
-| `stride` | 1 | 滑窗步长（1=每个时刻一个样本） |
+| `--data` | `data/input_nextday16h_20250820_35d.csv` | 输入 CSV 文件路径 |
+| `--result_dir` | `results/junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_142931` | 训练结果目录 |
+| `--provider` | `junshan_{model_type}_nextday16h` | 接口中的 provider 字段 |
+| `--output, -o` | 无（仅打印） | 输出 JSON 文件路径 |
 
-## 性能指标
+## 使用示例
 
-### 最优模型结果
+### 1. 基本预测
 
-| 数据集 | MAE (m³/h) | RMSE (m³/h) | MAPE (%) |
-|--------|------------|-------------|----------|
-| Train  | 91.74      | 128.41      | 3.06     |
-| Test   | 152.68     | 211.11      | **5.10** |
+```bash
+# 使用默认数据预测
+python junshan_inference.py
 
-- **模型**：iTransformer（自回归模式）
-- **测试集**：最后 90 天
-- **MAPE 过滤**：排除 |true| < 10% * max|true| 的近零流量点
+# 输出示例：
+# [1/4] 加载模型: results/junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_142931
+# [2/4] 读取 CSV: D:\Junshan_Project\data\input_nextday16h_20250820_35d.csv
+# [3/4] 数据清洗 + 特征构建
+# [4/4] 自回归推理
+# 
+# ============================================================
+# 预测结果:
+# {
+#   "date": "2025-08-21",
+#   "provider": "junshan_transformer_nextday16h",
+#   "unit": "m3/h",
+#   "interval_minutes": 60,
+#   "horizon": 24,
+#   "values": [2093.0, 1860.0, ...]
+# }
+```
 
-### 残差修正方法对比
+### 2. 指定输入文件
 
-| 方法 | MAE | MAE 提升 | MAPE (%) | MAPE 提升 |
-|------|-----|----------|----------|-----------|
-| Baseline | 152.68 | - | 5.10 | - |
-| 滑动窗口 (w=168) | 148.23 | +2.9% | 4.95 | +2.9% |
-| EWMA (α=0.3) | 147.89 | +3.1% | 4.92 | +3.5% |
-| 卡尔曼滤波 | 146.54 | +4.0% | 4.87 | +4.5% |
-| STL 分解 | 145.12 | +4.9% | 4.82 | +5.5% |
-| ARIMA(1,0,0) | 144.78 | +5.2% | 4.79 | +6.1% |
-| 在线线性修正 | 143.21 | +6.2% | 4.71 | +7.6% |
+```bash
+python junshan_inference.py --data D:\Junshan_Project\data\my_data.csv
+```
 
-## 优化方案
+### 3. 保存结果到文件
 
-详见 [`timeseries_transformer_optimization.md`](timeseries_transformer_optimization.md)，包含 8 项进阶优化策略：
+```bash
+python junshan_inference.py --output prediction_result.json
+```
 
-1. **注意力池化**：替代"取尾"，聚合全序列信息
-2. **局部卷积增强**：Conv1d 残差块提取局部时域特征
-3. **混合位置编码**：RoPE 旋转位置编码
-4. **差分平滑损失**：约束预测序列时序连续性
-5. **GELU 激活函数**：替代 ReLU
-6. **计划采样**：缓解 exposure bias
-7. **模型集成**：深度集成 + MC Dropout
-8. **多尺度特征融合**：多层 Encoder 输出拼接
+### 4. 指定其他模型
 
-## 可视化输出
+```bash
+python junshan_inference.py --result_dir results/other_model --provider my_model
+```
 
-### 逐日预测图
+### 5. 库调用
 
-训练完成后，`plots/` 目录下生成每日预测对比图（2025-10-01 ~ 2025-12-31）：
+```python
+from junshan_inference import predict
 
-- 蓝色实线：真实值
-- 红色虚线：预测值
-- 灰色填充：误差区域
+# 构建绝对路径
+HERE = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(HERE, "..", "data", "input_nextday16h_20250820_35d.csv")
+RESULT_DIR = os.path.join(HERE, "results", "junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_142931")
 
-### 评估图表
+# 调用预测函数
+result = predict(csv_path=CSV_PATH, result_dir=RESULT_DIR)
 
-- `loss_curve.png`：训练/测试损失曲线
-- `test_error_distribution.png`：误差分布直方图
-- `Test_best_cases.png` / `Test_worst_cases.png`：最优/最差预测案例
-- `eval_random_window.png`：逐日预测对比总图
+# 打印结果
+print("\n" + "=" * 60)
+print("预测结果:")
+print(json.dumps(result, ensure_ascii=False, indent=2))
+```
+
+## 数据处理流程
+
+1. **读取 CSV**：解析时间列，设置为索引
+2. **数据清洗**：
+   - 突变流量插值修正（日内/跨日双判据）
+   - Hampel 离群检测 + 物理界限裁剪（0~10000 m³/h）
+   - 重采样（60min，已是整点则恒等）
+3. **特征构建**：
+   - 日历特征：hour/dow/month/doy sin/cos + 工作日/节假日（12 维）
+   - 数据驱动特征：lag_24h, lag_168h（2 维）
+4. **自回归推理**：
+   - 取最后 184 小时作为回看窗口
+   - 滚动预测：先滚缺口（24-H 小时），再滚目标天 24 小时
+   - 每步回灌预测值，重算数据驱动特征
+5. **输出结果**：反归一化，提取目标天 24 小时预测值
+
+## 模型文件
+
+推理需要以下文件（位于 `result_dir` 目录）：
+
+| 文件 | 说明 |
+|------|------|
+| `scaler.pkl` | 训练配置、特征缩放器、目标缩放器、特征列 |
+| `best_seq2seq_model.pth` | 训练好的模型权重 |
+
+默认模型目录：
+```
+results/junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_142931/
+```
 
 ## 常见问题
 
-### Q: 如何使用自己的数据？
+### Q: 报错 "数据不足: 仅 XXX 行, 需要 184 步"
 
-1. 准备 CSV 文件，包含 `时间` 和 `出厂水流量` 两列
-2. 修改 `train_transformer_autoregressive.py` 中的 `BASE_CONFIG["file_path"]`
-3. 运行训练脚本
+A: 输入数据量不够，至少需要约 16 天（363 小时）的数据。建议使用 35 天以上的数据。
 
-### Q: 如何调整预测窗口？
+### Q: 报错 "CSV 必须包含 时间 / timestamp 列"
 
-修改 `lookback_days` 和 `predict_days` 参数：
+A: CSV 文件必须有时间列，列名可以是 `时间` 或 `timestamp`。
 
+### Q: 报错 "特征列缺失"
+
+A: 输入数据格式不正确，确保 CSV 包含 `时间` 和 `出厂水流量` 两列。
+
+### Q: 预测结果中 values 数组长度不是 24
+
+A: 正常情况下应为 24 个值（0:00~23:00）。如果数据截止时刻不是 15:00，可能会有调整。
+
+## 依赖库
+
+```
+numpy
+pandas
+torch
+chinese-calendar (可选，用于节假日特征)
+```
+
+安装依赖：
 ```bash
-python train_transformer_autoregressive.py --lookback 14  # 回看 14 天
+pip install numpy pandas torch chinese-calendar
 ```
-
-### Q: 训练太慢怎么办？
-
-1. 减小 `batch_size`（如 8）
-2. 增大 `stride`（如 2 或 4）
-3. 使用 GPU（自动检测 CUDA）
-4. 启用 AMP 混合精度训练（默认开启）
-
-### Q: 如何复现最佳结果？
-
-```bash
-cd transformer_pkg
-python train_transformer_autoregressive.py --model itransformer --label best_model
-```
-
-## 引用
-
-如果本项目对您的研究有帮助，请引用：
-
-```bibtex
-@software{junshan_flow_prediction,
-  title={Junshan Water Plant Flow Prediction with Transformer},
-  author={Junshan Project Team},
-  year={2025},
-  url={https://github.com/your-repo/junshan-project}
-}
-```
-
-## 许可证
-
-本项目仅供学术研究与内部使用。
-
-## 联系方式
-
-如有问题或建议，请通过 GitHub Issues 反馈。
-
----
-
-**最后更新**：2026-08-27

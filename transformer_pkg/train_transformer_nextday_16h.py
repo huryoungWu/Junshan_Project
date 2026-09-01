@@ -84,7 +84,7 @@ BASE_CONFIG = {
     "spike_ratio_cross": 1.3,    # 跨日 t±24h 突变阈值 (日间差异大, 需更高阈值)
 
     "lookback_days": 7,          # 前 7 天全天
-    "lookback_extra_hours": 16,  # + 当天 0:00~15:00 共 16 个小时 (16 点前)
+    "lookback_extra_hours": 12,  # + 当天 0:00~15:00 共 16 个小时 (16 点前)
                                  # 总回看 = 7*24 + 16 = 184 小时
     "predict_days": 1.0,         # 第二天全天 24 小时
     "label": f"junshan_L1D_P24H_1h_transformer_nextday16h_mc_{time.strftime('%Y%m%d_%H%M%S')}",

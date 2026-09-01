@@ -107,7 +107,7 @@ MIN_DATA_HOURS = 363
 MIN_DATA_DAYS = 16          # 消息用: ~16 天
 # 默认模型: 最新一次 nextday16h 多截止点训练
 DEFAULT_RESULT_DIR = os.path.join(
-    HERE, "results", "junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_002524")
+    HERE, "results", "junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_142931")
 
 DAY_STEPS = 24              # 目标天小时数
 UNIT = "m3/h"
@@ -377,42 +377,6 @@ class NextDayPredictor:
         mape_values = [r["mape"] for r in results if not np.isnan(r["mape"])]
         mape_raw_values = [r["mape_raw"] for r in results if not np.isnan(r["mape_raw"])]
 
-        # 数据点级别的 MAPE (与训练代码一致: 把所有天的所有小时展平后一起计算)
-        all_y_true = []
-        all_y_pred = []
-        for r in results:
-            # 从明细 CSV 读取每天的数据点
-            csv_path = r.get("csv_path")
-            if csv_path and os.path.exists(csv_path):
-                df = pd.read_csv(csv_path)
-                all_y_true.extend(df["actual"].values)
-                all_y_pred.extend(df["predict"].values)
-
-        if all_y_true:
-            all_y_true = np.array(all_y_true)
-            all_y_pred = np.array(all_y_pred)
-            floor_ratio = self.config.get("mape_floor_ratio", 0.05)
-            thr = floor_ratio * np.abs(all_y_true).max()
-            keep = np.abs(all_y_true) >= thr
-            n_total = len(all_y_true)
-            n_used = int(keep.sum())
-            if n_used > 0:
-                mape_pointwise = float(np.mean(
-                    np.abs((all_y_true[keep] - all_y_pred[keep]) / (all_y_true[keep] + 1e-8)) * 100))
-            else:
-                mape_pointwise = float("nan")
-            mape_pointwise_raw = float(np.mean(
-                np.abs((all_y_true - all_y_pred) / (all_y_true + 1e-8)) * 100))
-            # 调试信息
-            print(f"\n[调试] floor_ratio={floor_ratio}, thr={thr:.2f}")
-            print(f"[调试] y_true 范围: {np.min(all_y_true):.2f} ~ {np.max(all_y_true):.2f}")
-            print(f"[调试] 过滤前点数: {n_total}, 过滤后点数: {n_used}")
-        else:
-            mape_pointwise = float("nan")
-            mape_pointwise_raw = float("nan")
-            n_total = 0
-            n_used = 0
-
         summary = {
             "start_date": start_date,
             "end_date": end_date,
@@ -426,10 +390,6 @@ class NextDayPredictor:
             "min_mape": np.min(mape_values) if mape_values else float("nan"),
             "max_mape": np.max(mape_values) if mape_values else float("nan"),
             "avg_mape_raw": np.mean(mape_raw_values) if mape_raw_values else float("nan"),
-            "mape_pointwise": mape_pointwise,
-            "mape_pointwise_raw": mape_pointwise_raw,
-            "mape_n_total": n_total,
-            "mape_n_used": n_used,
         }
 
         # 打印汇总
@@ -437,7 +397,6 @@ class NextDayPredictor:
         print(f"汇总统计 ({start_date} ~ {end_date})")
         print(f"{'='*60}")
         print(f"成功预测天数: {summary['n_days']}")
-        print(f"\n【日级别统计】(每天计算MAPE后取平均)")
         print(f"MAE:  平均={summary['avg_mae']:.2f} m³/h, "
               f"标准差={summary['std_mae']:.2f}, "
               f"最小={summary['min_mae']:.2f}, 最大={summary['max_mae']:.2f}")
@@ -445,10 +404,6 @@ class NextDayPredictor:
               f"标准差={summary['std_mape']:.2f}%, "
               f"最小={summary['min_mape']:.2f}%, 最大={summary['max_mape']:.2f}%")
         print(f"MAPE (不过滤近零点): 平均={summary['avg_mape_raw']:.2f}%")
-        print(f"\n【数据点级别统计】(与训练代码一致: 所有天所有小时展平后计算)")
-        print(f"MAPE (过滤近零点): {summary['mape_pointwise']:.2f}%"
-              f" (保留 {summary['mape_n_used']}/{summary['mape_n_total']} 个点)")
-        print(f"MAPE (不过滤近零点): {summary['mape_pointwise_raw']:.2f}%")
 
         # 保存汇总到 CSV
         summary_df = pd.DataFrame(results)
