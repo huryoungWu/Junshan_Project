@@ -71,22 +71,25 @@ CALENDAR_COLS = [
 # ==================== 数据驱动特征 (从流量时序统计提取) ====================
 # 基于 Part1/Part2 图表揭示的规律设计:
 #   滞后:   昨天/上周同时段流量 (日内形状日间重复)
-#   滚动:   多尺度均值/标准差 (近似 Part1 多项式拟合趋势)
-#   日内:   当天峰谷幅度/早晚高峰比例 (Part2 曲线形状描述符)
-#   偏离:   Z-score (当前值相对近期水平的偏离程度)
 #
-# 所有特征用 shift() 避免未来信息泄露, 训练/推理口径一致。
+# 重要 (2026-09): 已删除全部"未来行泄漏"的特征 (原 18 个 → 现 2 个):
+#   - lag_24h_diff / lag_24h_ratio / flow_zscore_7d / flow_zscore_30d:
+#     引用 flow.shift(1) = 滚动 rollout 的上一小时 —— 训练/评估时该值是
+#     目标天的真实值 (泄漏), 推理时只能是模型自己的预测回灌, 口径不一致。
+#   - roll_mean_3d/7d/30d, roll_std_7d, roll_max_7d, roll_min_7d,
+#     roll_median_48h: 滚动窗含"截止时刻之后"的小时 (短窗泄漏占比高,
+#     长窗虽被稀释但严格意义上仍是泄漏)。
+#   - day_avg / day_peak_amp / morning/evening/night_ratio: 引用前一天
+#     全天统计; 对目标天 (D+1) 行引用 D 日 0:00~23:00, 其中 16:00~23:00
+#     是截止时刻之后的缺口 → 同样泄漏。
+#   实测影响: 同一批测试天, 训练评估口径 vs 推理口径相差 ~0.7% MAPE
+#   (见 _diag_inference_gap.py), 训练测试集指标虚好。
+#   保留的 lag_24h / lag_168h 为纯 shift: 未来行引用的小时恒 ≤ 截止时刻
+#   (对目标天 D+1: D+1-24h = D 当天, D+1-168h = D-6), 无泄漏。
 # 新增 / 修改后必须重新训练 (旧 scaler.pkl 的 feature_cols 校验不匹配)。
 DATA_DRIVEN_COLS = [
-    # 滞后特征
-    "lag_24h", "lag_168h", "lag_24h_diff", "lag_24h_ratio",
-    # 滚动统计
-    "roll_mean_3d", "roll_mean_7d", "roll_mean_30d",
-    "roll_std_7d", "roll_max_7d", "roll_min_7d", "roll_median_48h",
-    # 日内形状 (shift 1 天, 用前一天完整日内统计, 避免当天前瞻)
-    "day_avg", "day_peak_amp", "morning_ratio", "evening_ratio", "night_ratio",
-    # 偏离特征
-    "flow_zscore_7d", "flow_zscore_30d",
+    # 滞后特征 (纯 shift, 无泄漏)
+    "lag_24h", "lag_168h",
 ]
 
 # 旧版日历特征 (兼容旧模型: hour_sin/cos, dayofweek, is_weekend)
@@ -242,9 +245,13 @@ class DataProcessor:
         """基于流量时序统计的特征, 捕捉图表中可见的季节/日内模式。
 
         在 add_calendar_features() 之后调用, 依赖 Total_Flow 列。
-        所有特征用 shift() 避免未来信息泄露:
-          - 滚动/偏离特征: shift(1) 确保只用当前时刻之前的数据
-          - 日内形状特征: shift(24) 用前一天完整日内统计, 避免当天前瞻
+        只保留对未来行 (自回归 rollout 的 Xf) 也无泄漏的特征:
+          - lag_24h / lag_168h: 昨天/上周同时段 (纯 shift, 未来行引用的时刻
+            恒 ≤ 截止时刻: 对目标天 D+1 行, D+1-24h = D 当天, D+1-168h = D-6)
+        已删除 (2026-09): 引用 flow.shift(1) / 滚动窗 / 前一天全天统计的
+        16 个特征 (见 DATA_DRIVEN_COLS 注释) —— 它们在未来行的值含"截止时刻
+        之后"的流量, 训练/评估时是目标天真实值 (泄漏), 推理时只能是预测
+        回灌值, 训练/推理口径不一致导致训练测试集指标虚好。
 
         Args:
             df: 带 DatetimeIndex 的 DataFrame, 含 Total_Flow + 日历特征
@@ -255,69 +262,10 @@ class DataProcessor:
         out = df.copy()
         flow = out["Total_Flow"]
 
-        # ── 1. 滞后特征: 昨天/上周同时段 (Part2: 日内形状日间高度重复) ──
-        # lag_*: 纯 shift, 只用过去点, 无泄露。
-        # lag_24h_diff/ratio: 原版含 flow[t] (预测目标) → 泄露。改为以最近已知点
-        #   flow[t-1] 为基准对 24h 前做差/比, 结构不变 (X 对 24h 前的 X), 全过去。
+        # ── 滞后特征: 昨天/上周同时段 (Part2: 日内形状日间高度重复) ──
+        # 纯 shift, 只用过去点, 无泄漏。
         out["lag_24h"] = flow.shift(24).astype(np.float32)
         out["lag_168h"] = flow.shift(168).astype(np.float32)
-        out["lag_24h_diff"] = (flow.shift(1) - flow.shift(25)).astype(np.float32)
-        out["lag_24h_ratio"] = (flow.shift(1) / flow.shift(25).replace(0, np.nan)).astype(np.float32)
-
-        # ── 2. 滚动统计: 多尺度趋势 (Part1: 多项式拟合的离散近似) ──
-        # shift(1): 严格用当前时刻之前的数据, 避免信息泄露
-        flow_shifted = flow.shift(1)
-
-        out["roll_mean_3d"] = flow_shifted.rolling(72, min_periods=36).mean().astype(np.float32)
-        out["roll_mean_7d"] = flow_shifted.rolling(168, min_periods=84).mean().astype(np.float32)
-        out["roll_mean_30d"] = flow_shifted.rolling(720, min_periods=360).mean().astype(np.float32)
-        out["roll_std_7d"] = flow_shifted.rolling(168, min_periods=84).std().astype(np.float32)
-        out["roll_max_7d"] = flow_shifted.rolling(168, min_periods=84).max().astype(np.float32)
-        out["roll_min_7d"] = flow_shifted.rolling(168, min_periods=84).min().astype(np.float32)
-        out["roll_median_48h"] = flow_shifted.rolling(48, min_periods=24).median().astype(np.float32)
-
-        # ── 3. 日内形状特征: 用前一天完整日内统计 (shift 24h) ──
-        # Part2 显示日内曲线形状稳定但幅度随季节变化
-        day_groups = flow.groupby(flow.index.normalize())
-        daily_stats = day_groups.agg(
-            day_avg="mean",
-            day_max="max",
-            day_min="min",
-        )
-        daily_stats["day_peak_amp"] = daily_stats["day_max"] - daily_stats["day_min"]
-
-        # 早晚高峰均值
-        h = flow.index.hour
-        morning_mask = (h >= 7) & (h <= 10)
-        evening_mask = (h >= 18) & (h <= 21)
-        night_mask = (h >= 0) & (h <= 5)
-        day_dates = flow.index.normalize()
-        daily_stats["morning_avg"] = flow.where(morning_mask).groupby(day_dates).mean()
-        daily_stats["evening_avg"] = flow.where(evening_mask).groupby(day_dates).mean()
-        daily_stats["night_avg"] = flow.where(night_mask).groupby(day_dates).mean()
-
-        # 高峰比例 = 高峰均值 / 全天均值
-        daily_stats["morning_ratio"] = (daily_stats["morning_avg"] / daily_stats["day_avg"].replace(0, np.nan))
-        daily_stats["evening_ratio"] = (daily_stats["evening_avg"] / daily_stats["day_avg"].replace(0, np.nan))
-        daily_stats["night_ratio"] = (daily_stats["night_avg"] / daily_stats["day_avg"].replace(0, np.nan))
-
-        # 只保留需要的列, shift 1 天避免当天前瞻
-        day_feats = daily_stats[["day_avg", "day_peak_amp", "morning_ratio",
-                                 "evening_ratio", "night_ratio"]].shift(1)
-
-        # 映射回小时级
-        for col in day_feats.columns:
-            out[col] = day_dates.map(day_feats[col]).astype(np.float32)
-
-        # ── 4. 偏离特征: 最近已知值相对近期水平 (Part1: 拟合残差的统计描述) ──
-        # 原版用 flow[t] (预测目标) → 泄露。改为 flow.shift(1)=flow[t-1] (最近已知
-        #   小时) 对滚动均值/标准差做 zscore; roll_mean_7d 等本身只用 ≤t-1, 全过去。
-        r7_mean = out["roll_mean_7d"]
-        r7_std = out["roll_std_7d"].replace(0, np.nan)
-        out["flow_zscore_7d"] = ((flow.shift(1) - r7_mean) / r7_std).astype(np.float32)
-
-        r30_std = flow_shifted.rolling(720, min_periods=360).std().replace(0, np.nan)
-        out["flow_zscore_30d"] = ((flow.shift(1) - out["roll_mean_30d"]) / r30_std).astype(np.float32)
 
         return out
 
@@ -395,6 +343,16 @@ class DataProcessor:
         # 以插值修正值保留参与训练 (若放在 Hampel 之后, 极端突变已被置 NaN 删除) ──
         self.correct_flow_spikes(out)
 
+        # ── 可选: 滚动中位数平滑 (config: smooth_median_window, 默认 None=关闭) ──
+        # 去仪表级噪声; 放在 Hampel 之前, 不改变"Hampel 检出置 NaN 删除"的语义。
+        # 注意: 会轻微削平单小时尖峰, 是否启用需与未平滑版本对比验证 (改进5)。
+        smooth_win = self.config.get("smooth_median_window")
+        if smooth_win and smooth_win >= 3:
+            out["Total_Flow"] = (out["Total_Flow"].rolling(smooth_win, center=True,
+                                                           min_periods=1).median()
+                                 .astype(np.float32))
+            print(f"  滚动中位数平滑: window={smooth_win} (center, min_periods=1)")
+
         # ── Hampel 清洗: 检出后置 NaN, 与物理界限越界值一起在重采样时剔除 ──
         # hampel_cols 配置里不在 out.columns 的列 (如历史遗留的 Target_Pressure) 自动跳过
         hampel_targets = [c for c in self.config.get("hampel_cols", ["Total_Flow"])
@@ -468,16 +426,24 @@ class DataProcessor:
         n1, n2 = f.shift(within_steps), f.shift(-within_steps)   # 日内参考: t±1h
         p1, p2 = f.shift(day_steps), f.shift(-day_steps)         # 跨日参考: t±1 天
 
-        def flags(cur, r1, r2, ok1, ok2, k):
+        # 绝对幅值下限 (config: spike_abs_floor, 默认 None=不启用):
+        # 夜间流量很小, 相对 20% 的偏离可能只是仪表噪声; 要求绝对偏离也超过
+        # 下限才判突变, 防止夜间低流量点被误修正 (改进3)。
+        abs_floor = self.config.get("spike_abs_floor")
+
+        def flags(cur, r1, r2, ok1, ok2, k, abs_floor=None):
             ref_hi = pd.concat([r1, r2], axis=1).max(axis=1)
             ref_lo = pd.concat([r1, r2], axis=1).min(axis=1)
             hi = (cur > k * ref_hi) & (ref_hi > 0)
             lo = (cur < ref_lo / k) & (ref_lo > 0)
+            if abs_floor:
+                hi = hi & (cur - ref_hi >= abs_floor)
+                lo = lo & (ref_lo - cur >= abs_floor)
             # ok 含时间间隔校验; 参考点 NaN (被 Hampel 等置空) 时 ref 为 NaN → 判据不命中
             return (hi | lo) & ok1 & ok2 & r1.notna() & r2.notna()
 
-        within_anom = flags(f, n1, n2, n1_ok, n2_ok, k_within)  # 判据1: 日内 t±1h
-        day_anom = flags(f, p1, p2, p1_ok, p2_ok, k_cross)     # 判据2: 跨日 t±1 天
+        within_anom = flags(f, n1, n2, n1_ok, n2_ok, k_within, abs_floor)  # 判据1: 日内 t±1h
+        day_anom = flags(f, p1, p2, p1_ok, p2_ok, k_cross, abs_floor)     # 判据2: 跨日 t±1 天
         anomaly = within_anom | day_anom
         if not anomaly.any():
             return res
@@ -492,7 +458,8 @@ class DataProcessor:
 
         print(f"  突变流量插值修正: {n_anom} 条 ({n_anom / len(res):.3%}) "
               f"[日内 k={k_within} {int(within_anom.sum())} / "
-              f"跨日 k={k_cross} {int((day_anom & ~within_anom).sum())}]")
+              f"跨日 k={k_cross} {int((day_anom & ~within_anom).sum())}"
+              f"{' / 绝对幅值下限≥' + str(abs_floor) if abs_floor else ''}]")
         for t in anomaly[anomaly].index[:5]:
             print(f"    {t}  {orig[t]:9.1f} → {fix[t]:9.1f}")
         return res
