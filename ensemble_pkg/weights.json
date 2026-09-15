@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "alpha": 0.32,
+  "alpha_transformer": 0.32,
+  "alpha_timesfm": 0.6799999999999999,
+  "fit_metric": "mae",
+  "fit_resolution": "1h",
+  "fit_window": "2025-10-03 ~ 2025-11-16 (45 天)",
+  "valid_window": "2025-11-17 ~ 2025-12-31 (45 天)",
+  "alpha_valid_estimate": 0.385,
+  "alpha_mse_closed_form": 0.34130449107412625,
+  "error_correlation": 0.8019586528263662,
+  "n_timesfm_guard_clipped": 0,
+  "valid_metrics": {
+    "Transformer (α=1)": {
+      "mae": 167.51005226417823,
+      "rmse": 225.17021059090055,
+      "mape": 5.840496702927565
+    },
+    "TimesFM (α=0)": {
+      "mae": 159.8078678837529,
+      "rmse": 219.37702588578452,
+      "mape": 5.602040266144785
+    },
+    "融合 (α=0.320)": {
+      "mae": 153.9686255244502,
+      "rmse": 212.28785201440186,
+      "mape": 5.358657979382545
+    }
+  },
+  "transformer_result_dir": "d:\\Junshan_Project\\transformer_pkg\\results\\junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_155317",
+  "timesfm_model_path": "d:\\Junshan_Project\\timesfm_model",
+  "n_fit_points": 1080,
+  "n_valid_points": 1080,
+  "mape_min_actual": 0.0,
+  "created_at": "2026-09-15T16:41:35"
+}
