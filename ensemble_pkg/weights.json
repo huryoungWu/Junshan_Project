@@ -1,38 +1,217 @@
 {
   "schema_version": 1,
-  "alpha": 0.32,
-  "alpha_transformer": 0.32,
-  "alpha_timesfm": 0.6799999999999999,
+  "alpha": 0.36,
+  "alpha_transformer": 0.36,
+  "alpha_timesfm": 0.64,
   "fit_metric": "mae",
   "fit_resolution": "1h",
+  "decision_hour": 15,
   "fit_window": "2025-10-03 ~ 2025-11-16 (45 天)",
   "valid_window": "2025-11-17 ~ 2025-12-31 (45 天)",
-  "alpha_valid_estimate": 0.385,
-  "alpha_mse_closed_form": 0.3413048117645682,
-  "error_correlation": 0.8019586142193879,
+  "alpha_valid_estimate": 0.45,
+  "alpha_mse_closed_form": 0.4278447255147337,
+  "error_correlation": 0.8290766204731926,
   "n_timesfm_guard_clipped": 0,
   "valid_metrics": {
     "Transformer (α=1)": {
-      "mae": 167.51005226417823,
-      "rmse": 225.17021059090055,
-      "mape": 5.840496702927565
+      "mae": 167.10129145869502,
+      "rmse": 224.59447068639605,
+      "mape": 5.8168136731901035
     },
     "TimesFM (α=0)": {
-      "mae": 159.80788619429975,
-      "rmse": 219.3770466443221,
-      "mape": 5.60204109822503
+      "mae": 164.53383563006366,
+      "rmse": 224.33761454576543,
+      "mape": 5.781453991614102
     },
-    "融合 (α=0.320)": {
-      "mae": 153.96863213433156,
-      "rmse": 212.28786507705232,
-      "mape": 5.358658305941736
+    "融合 (α=0.360)": {
+      "mae": 156.56593888346353,
+      "rmse": 214.73449071035262,
+      "mape": 5.4632384559689156
     }
   },
-  "transformer_result_dir": "d:\\Junshan_Project\\transformer_pkg\\results\\junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_155317",
-  "timesfm_model_path": "d:\\Junshan_Project\\timesfm_model_transformers",
+  "transformer_result_dir": "D:\\Junshan_Project\\transformer_pkg\\results\\junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_155317",
+  "timesfm_model_path": "D:\\Junshan_Project\\timesfm_model_transformers",
   "lora_path": null,
+  "interval": {
+    "method": "vincentization",
+    "calibration_path": "D:\\Junshan_Project\\ensemble_pkg\\results\\quantile_calibration.json",
+    "calibration_window": "2025-10-03 ~ 2025-11-16 (45 天)",
+    "median_gap": 0.0,
+    "valid_metrics": {
+      "TimesFM 原生区间": {
+        "crps": 132.34017391754276,
+        "pinball": 66.17008695877138,
+        "levels": [
+          {
+            "nominal": 0.8,
+            "picp": 0.7731481481481481,
+            "mpiw": 519.7989091661241,
+            "winkler": 593.6816123114692,
+            "pinball": 40.76648608737521
+          },
+          {
+            "nominal": 0.6,
+            "picp": 0.5805555555555556,
+            "mpiw": 313.96418547453703,
+            "winkler": 516.1111370322145,
+            "pinball": 61.71846128110531
+          },
+          {
+            "nominal": 0.4,
+            "picp": 0.4101851851851852,
+            "mpiw": 193.21155497233073,
+            "winkler": 641.7969544587312,
+            "pinball": 73.84027319448965
+          },
+          {
+            "nominal": 0.2,
+            "picp": 0.21666666666666667,
+            "mpiw": 92.45430704752604,
+            "winkler": 1328.771315737124,
+            "pinball": 80.30671184398508
+          }
+        ]
+      },
+      "Transformer 残差校准": {
+        "crps": 135.8586888317218,
+        "pinball": 67.9293444158609,
+        "levels": [
+          {
+            "nominal": 0.8,
+            "picp": 0.8018518518518518,
+            "mpiw": 585.5970286051434,
+            "winkler": 660.8093617380401,
+            "pinball": 44.32231805683654
+          },
+          {
+            "nominal": 0.6,
+            "picp": 0.6351851851851852,
+            "mpiw": 365.67473144531255,
+            "winkler": 540.2645896126704,
+            "pinball": 62.75595186963493
+          },
+          {
+            "nominal": 0.4,
+            "picp": 0.43425925925925923,
+            "mpiw": 230.65244344075515,
+            "winkler": 634.5133216386961,
+            "pinball": 74.98395433590736
+          },
+          {
+            "nominal": 0.2,
+            "picp": 0.21574074074074073,
+            "mpiw": 107.16743367513013,
+            "winkler": 1315.3877538610393,
+            "pinball": 81.84450274432146
+          }
+        ]
+      },
+      "方案A vincentization": {
+        "crps": 126.35043927238056,
+        "pinball": 63.17521963619028,
+        "levels": [
+          {
+            "nominal": 0.8,
+            "picp": 0.812962962962963,
+            "mpiw": 543.486232164171,
+            "winkler": 607.2589441935221,
+            "pinball": 39.92885401407877
+          },
+          {
+            "nominal": 0.6,
+            "picp": 0.6462962962962963,
+            "mpiw": 332.5799820240162,
+            "winkler": 502.65805329499415,
+            "pinball": 58.76970889304832
+          },
+          {
+            "nominal": 0.4,
+            "picp": 0.45,
+            "mpiw": 206.6902748209635,
+            "winkler": 597.103724093967,
+            "pinball": 70.04488615044487
+          },
+          {
+            "nominal": 0.2,
+            "picp": 0.23055555555555557,
+            "mpiw": 97.75103263346352,
+            "winkler": 1234.8179937879777,
+            "pinball": 76.40355458441842
+          }
+        ]
+      },
+      "方案B 直接校准": {
+        "crps": 128.13137289051113,
+        "pinball": 64.06568644525557,
+        "levels": [
+          {
+            "nominal": 0.8,
+            "picp": 0.8231481481481482,
+            "mpiw": 590.922443806966,
+            "winkler": 655.9669050051842,
+            "pinball": 42.55501442999192
+          },
+          {
+            "nominal": 0.6,
+            "picp": 0.662962962962963,
+            "mpiw": 347.14289953613286,
+            "winkler": 513.5074696888864,
+            "pinball": 59.66897547652634
+          },
+          {
+            "nominal": 0.4,
+            "picp": 0.4648148148148148,
+            "mpiw": 214.81107836914063,
+            "winkler": 598.8535241367671,
+            "pinball": 70.62590633213374
+          },
+          {
+            "nominal": 0.2,
+            "picp": 0.25462962962962965,
+            "mpiw": 103.63159969075522,
+            "winkler": 1215.1893618103784,
+            "pinball": 76.3042080441322
+          }
+        ]
+      },
+      "方案A' mixture": {
+        "crps": 126.5704890186652,
+        "pinball": 63.2852445093326,
+        "levels": [
+          {
+            "nominal": 0.8,
+            "picp": 0.8138888888888889,
+            "mpiw": 544.856808782662,
+            "winkler": 607.6069397263594,
+            "pinball": 39.7928666278726
+          },
+          {
+            "nominal": 0.6,
+            "picp": 0.6675925925925926,
+            "mpiw": 350.2953891803724,
+            "winkler": 511.2779488828885,
+            "pinball": 59.17692287341466
+          },
+          {
+            "nominal": 0.4,
+            "picp": 0.47129629629629627,
+            "mpiw": 212.4950000311181,
+            "winkler": 595.8960748896395,
+            "pinball": 70.21435749051986
+          },
+          {
+            "nominal": 0.2,
+            "picp": 0.2462962962962963,
+            "mpiw": 101.12392845649143,
+            "winkler": 1225.787586216999,
+            "pinball": 76.45796857932365
+          }
+        ]
+      }
+    }
+  },
   "n_fit_points": 1080,
   "n_valid_points": 1080,
   "mape_min_actual": 0.0,
-  "created_at": "2026-09-16T14:46:54"
+  "created_at": "2026-09-16T17:19:49"
 }

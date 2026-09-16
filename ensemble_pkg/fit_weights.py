@@ -34,7 +34,6 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import torch
 
 # GBK 控制台兼容
 if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
@@ -53,8 +52,10 @@ TRANSFORMER_PKG_DIR = ensure_import_paths(verbose=True)
 from data_processing import DataProcessor                                # type: ignore # noqa: E402
 from ensemble_predictor import (                                         # noqa: E402
     JunshanEnsemblePredictor, fuse, model_fingerprint,
+    fuse_quantiles, anchor_median, enforce_monotone, qf_columns, day_interval,
+    QUANTILE_LEVELS, MEDIAN_INDEX,
     DEFAULT_RESULT_DIR, DEFAULT_TIMESFM_MODEL, DEFAULT_WEIGHTS_PATH,
-    DEFAULT_RAW_DATA, DAY_STEPS, CONTEXT_HOURS,
+    DEFAULT_RAW_DATA, DEFAULT_CALIB_PATH, DAY_STEPS, CONTEXT_HOURS,
 )
 
 DEFAULT_OUT_DIR = os.path.join(_HERE, "results")
@@ -137,16 +138,137 @@ def err_correlation(pred_t, pred_f, y_true):
     return float(np.corrcoef(et, ef)[0, 1])
 
 
+# ==================== 区间 (概率预测) 指标 ====================
+
+def interval_scores(y_true, q, levels=QUANTILE_LEVELS):
+    """区间质量指标。
+
+    q: (N, L) 分位数矩阵, q[:, j] 对应 levels[j]。
+
+    返回 {"crps", "pinball", "levels": [{nominal, picp, mpiw, winkler, pinball}]}
+      PICP    经验覆盖率 (应贴近 nominal)
+      MPIW    平均区间宽度 (同覆盖率下越窄越好)
+      Winkler 区间得分 (主指标, 越小越好):
+              IS = (u-l) + (2/a)(l-y)·1{y<l} + (2/a)(y-u)·1{y>u}
+              其中 a = 误覆盖率 = 1 - 名义覆盖率 (Gneiting & Raftery 2007)。
+              80% 区间 -> a = 0.20 -> 惩罚系数 2/0.20 = 10。
+      pinball 分位数损失; 对 levels 取平均再 ×2 ≈ CRPS
+    """
+    y = np.asarray(y_true, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    lv = np.asarray(levels, dtype=np.float64)
+    L = len(lv)
+    ok = np.isfinite(y) & np.isfinite(q).all(axis=1)
+    y, q = y[ok], q[ok]
+    if len(y) == 0:
+        return {"crps": float("nan"), "pinball": float("nan"), "levels": []}
+
+    pins = np.stack([
+        np.where(y >= q[:, j], lv[j] * (y - q[:, j]), (1.0 - lv[j]) * (q[:, j] - y))
+        for j in range(L)], axis=1)                       # (N, L)
+
+    rows = []
+    for j in range(L):
+        if lv[j] >= 0.5:
+            continue
+        k = L - 1 - j                                     # 对称的另一侧
+        lo, hi = q[:, j], q[:, k]
+        nominal = float(lv[k] - lv[j])                # 名义覆盖率 (如 0.80)
+        alpha_mis = 1.0 - nominal                     # 误覆盖率 (如 0.20)
+        IS = (hi - lo) + (2.0 / alpha_mis) * (lo - y) * (y < lo) + \
+            (2.0 / alpha_mis) * (y - hi) * (y > hi)
+        rows.append({
+            "nominal": round(nominal, 2),
+            "picp": float(np.mean((y >= lo) & (y <= hi))),
+            "mpiw": float(np.mean(hi - lo)),
+            "winkler": float(np.mean(IS)),
+            "pinball": float((pins[:, j] + pins[:, k]).mean() / 2.0),
+        })
+
+    return {"crps": float(2.0 * pins.mean()),
+            "pinball": float(pins.mean()), "levels": rows}
+
+
+def calibrate_residual_quantiles(pred_cols, y_true, hours, is_fit,
+                                 levels=QUANTILE_LEVELS, min_count=40,
+                                 smooth=True):
+    """用样本外回测残差标定逐小时经验分位数 (中位数中心化)。
+
+    ĝ(τ, hour) = quantile_τ(resid[hour]) - quantile_0.5(resid[hour])
+
+    中心化保证 q(0.5) = pred + 0 = pred, 即点预测不被概率预测改动。
+    桶内样本不足 min_count 时回退到全局池化分位数。
+
+    pred_cols: {"transformer": 数组, "ensemble": 数组} — 各自标定一份
+    hours: 每个回测点的小时 (0..23)
+    is_fit: 用于标定的布尔掩码 (必须与 α 拟合窗口独立或至少不在 valid 上)
+
+    返回 (hourly_dict, meta_dict)
+    """
+    y = np.asarray(y_true, dtype=np.float64)
+    hours = np.asarray(hours)
+    is_fit = np.asarray(is_fit, dtype=bool)
+    L = len(levels)
+
+    hourly, meta = {}, {}
+    for key, pred in pred_cols.items():
+        resid = np.asarray(pred, dtype=np.float64) - y
+        # 丢弃非有限点, 否则 np.quantile 会把整桶污染成 NaN
+        calib_ok = is_fit & np.isfinite(resid)
+        if not calib_ok.any():
+            raise ValueError(f"{key} 的校准残差全为非有限值, 无法校准")
+        pool = np.quantile(resid[calib_ok], levels)
+        pool = pool - pool[MEDIAN_INDEX]
+
+        tab = np.zeros((DAY_STEPS, L), dtype=np.float64)
+        counts = np.zeros(DAY_STEPS, dtype=int)
+        n_fallback = 0
+        for h in range(DAY_STEPS):
+            r = resid[calib_ok & (hours == h)]
+            counts[h] = len(r)
+            if len(r) >= min_count:
+                qq = np.quantile(r, levels)
+                tab[h] = qq - qq[MEDIAN_INDEX]
+            else:
+                tab[h] = pool
+                n_fallback += 1
+
+        if smooth:
+            # 时刻的 0 点和 23 点是相邻的, 用循环 3 点均值降噪 (保序, 中位数仍为 0)
+            tab = (np.roll(tab, 1, axis=0) + tab + np.roll(tab, -1, axis=0)) / 3.0
+            tab = enforce_monotone(tab)
+
+        hourly[key] = tab
+        meta[key] = {"pooled": pool.tolist(),
+                     "n_per_hour": counts.tolist(),
+                     "n_fallback_hours": int(n_fallback),
+                     "n_points": int(is_fit.sum())}
+    return hourly, meta
+
+
+def residual_quantile_table(calib, key, pred_point, hours):
+    """把校准表套到点预测上: q = pred + ĝ(τ, hour)。"""
+    tab = np.asarray(calib["hourly"][key], dtype=np.float64)
+    pred_point = np.asarray(pred_point, dtype=np.float64)
+    hours = np.asarray(hours)
+    return pred_point[:, None] + tab[hours]
+
+
 # ==================== 回测 ====================
 
 def run_backtest(predictor, raw_df, test_days,
-                 context_days=BACKTEST_CONTEXT_DAYS):
-    """逐日滚动回测: 截断到目标日前一天, 两个模型分别预测当天。
+                 context_days=BACKTEST_CONTEXT_DAYS, decision_hour=15):
+    """逐日滚动回测: 截断到决策时刻, 两个模型分别预测当天。
+
+    生产口径是"每天 16 点做次日全天预测", 此刻手上只有前一天 15:00 为止的
+    数据 (decision_hour=15)。回测必须用同一个截止点, 否则会给模型喂进生产
+    拿不到的数据 (前一天 16:00~23:00 共 8 小时), 指标偏乐观。
 
     predictor: JunshanEnsemblePredictor (已初始化)
     raw_df: 原始 DataFrame (时间索引 + 出厂水流量)
     test_days: 回测天数列表或 int
     context_days: 每个回测窗口的上下文天数
+    decision_hour: 决策时刻可用数据的最后小时 (默认 15; 23 表示可用整个前一天)
 
     返回: (backtest_df, per_day_df)
     """
@@ -169,43 +291,43 @@ def run_backtest(predictor, raw_df, test_days,
     for i, day in enumerate(days):
         print(f"\n[回测 {i+1}/{len(days)}] {day.date()}", end="")
 
-        # ① 截断数据: day 之前 context_days 天
-        cutoff_ts = day
-        mask = (raw_df.index >= cutoff_ts - pd.Timedelta(days=context_days)) & \
-               (raw_df.index < cutoff_ts)
+        # ① 截断数据: 到决策时刻 (前一天 decision_hour 点) 为止的 context_days 天
+        decision_ts = day.normalize() - pd.Timedelta(days=1) + \
+            pd.Timedelta(hours=decision_hour)
+        mask = (raw_df.index > decision_ts - pd.Timedelta(days=context_days)) & \
+               (raw_df.index <= decision_ts)
         win_raw = raw_df.loc[mask]
         if len(win_raw) == 0:
             print("  [跳过] 无数据")
             continue
 
-        # ② Transformer 预测
+        # ② Transformer 预测 (自己滚过日内缺口, 与生产一致)
         try:
             pred_t = predictor.predict_transformer(win_raw, target_date=day)
         except Exception as e:
             print(f"  [失败] Transformer: {e}")
             continue
 
-        # ③ TimesFM 预测 (用全量清洗数据的 context, 不截断)
+        # ③ TimesFM 预测 (与生产同一条代码路径, 保证对齐口径一致)
         try:
-            ctx = hourly_full[hourly_full.index < cutoff_ts].iloc[-CONTEXT_HOURS:]
-            if len(ctx) < 48:
-                raise ValueError(f"context 仅 {len(ctx)} 小时")
-            ctx_tensor = torch.tensor(ctx.to_numpy(dtype=np.float64), dtype=torch.float32)
-            with torch.no_grad():
-                outputs = predictor.tfm(
-                    past_values=[ctx_tensor],
-                    forecast_context_len=16256)
-            pred_f = outputs.mean_predictions[0, :DAY_STEPS].cpu().numpy().astype(np.float64)
+            pred_f, q_f = predictor.predict_timesfm_quantiles(win_raw, target_date=day)
         except Exception as e:
             print(f"  [失败] TimesFM: {e}")
             continue
 
-        # ④ 安全网: TimesFM 异常值裁剪
-        ref = float(np.median(ctx.to_numpy()))
+        # ④ 安全网: TimesFM 异常值裁剪 (点预测 + 分位数, 裁剪后恢复单调)
+        ref_ctx = hourly_full[hourly_full.index <= decision_ts].iloc[-CONTEXT_HOURS:]
+        ref = float(np.median(ref_ctx.to_numpy()))
         lo, hi = 0.3 * ref, 3.0 * ref
         n_clipped = int(((pred_f < lo) | (pred_f > hi)).sum())
         if n_clipped:
             pred_f = np.clip(pred_f, lo, hi)
+        if q_f.shape == (DAY_STEPS, len(QUANTILE_LEVELS)):
+            # 裁剪到护栏区间, 再把中位数钉回 pred_f (anchor_median 会同时
+            # 投影左右两侧, 避免裁剪+钉中位数把单调性弄坏)
+            q_f = anchor_median(np.clip(q_f, lo, hi), pred_f)
+        else:
+            q_f = None
 
         # ⑤ 真值: 清洗后的当天24小时
         day_mask = hourly_full.index.normalize() == day
@@ -215,18 +337,25 @@ def run_backtest(predictor, raw_df, test_days,
             continue
         y_true = actual_day.iloc[:DAY_STEPS].to_numpy(dtype=np.float64)
         n_true = len(y_true)
+        n_gap = max(0, 23 - decision_hour)      # 15 -> 8 (前一天 16:00~23:00)
 
         print(f"  T:{len(pred_t)} | F:{len(pred_f)} | 真值:{n_true}"
+              f" | 日内缺口:{n_gap}h"
               f"{' | 裁剪:'+str(n_clipped) if n_clipped else ''}")
 
-        # 逐点记录
+        # 逐点记录 (qf_10..qf_90 = TimesFM 原生分位数, 供区间校准与出图复用)
         times = pd.date_range(start=day, periods=DAY_STEPS, freq="h")
-        frames.append(pd.DataFrame({
+        row = {
             "date": str(day.date()),
             "y_true": y_true, "pred_transformer": pred_t, "pred_timesfm": pred_f,
-        }, index=times))
+        }
+        if q_f is not None:
+            for j, lvl in enumerate(QUANTILE_LEVELS):
+                row[f"qf_{int(round(lvl * 100)):02d}"] = q_f[:, j]
+        frames.append(pd.DataFrame(row, index=times))
         per_day.append({"date": str(day.date()), "n_points": DAY_STEPS,
-                        "n_true": n_true, "n_timesfm_clipped": n_clipped})
+                        "n_true": n_true, "n_timesfm_clipped": n_clipped,
+                        "n_gap_steps": n_gap, "decision_hour": decision_hour})
 
     if not frames:
         return pd.DataFrame(), pd.DataFrame()
@@ -305,12 +434,14 @@ def plot_comparison(bt, alpha, valid_start, save_path):
 
 
 def plot_daily_figures(bt, save_dir, alpha, valid_start=None, per_day_y=False,
-                       mape_min_actual=0.0):
-    """逐日对比图: 每天一张。"""
+                       mape_min_actual=0.0, calib=None,
+                       interval_method="vincentization", with_band=True):
+    """逐日对比图: 每天一张 (+ 可选 80% 区间带)。"""
     _setup_cn_font()
     import matplotlib.pyplot as plt
     os.makedirs(save_dir, exist_ok=True)
 
+    n_band = 0
     dates = sorted(bt["date"].unique())
     for day_str in dates:
         day_data = bt[bt["date"] == day_str]
@@ -323,11 +454,19 @@ def plot_daily_figures(bt, save_dir, alpha, valid_start=None, per_day_y=False,
         pe = fuse(alpha, pt, pf)
         hours = np.arange(len(y))
 
+        q_e = day_interval(day_data, alpha, calib, interval_method) \
+            if with_band else None
+        if q_e is not None:
+            n_band += 1
+
         mae_t = np.mean(np.abs(pt - y))
         mae_f = np.mean(np.abs(pf - y))
         mae_e = np.mean(np.abs(pe - y))
 
         fig, ax = plt.subplots(figsize=(12, 5))
+        if q_e is not None:
+            ax.fill_between(hours, q_e[:, 0], q_e[:, -1], color="#e74c3c",
+                            alpha=0.15, linewidth=0, label="80% 区间")
         ax.plot(hours, y, color="#2c3e50", linewidth=1.8, marker="o", ms=3, label="真实值")
         ax.plot(hours, pt, color="#3498db", linewidth=1.2, linestyle="--",
                 marker="s", ms=2, label=f"Transformer (MAE={mae_t:.0f})")
@@ -351,7 +490,235 @@ def plot_daily_figures(bt, save_dir, alpha, valid_start=None, per_day_y=False,
                     dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-    print(f"[plot] 逐日图已保存: {save_dir} ({len(dates)} 张)")
+    print(f"[plot] 逐日图已保存: {save_dir} ({len(dates)} 张)"
+          + (f" (其中 {n_band} 张含 80% 区间带)" if n_band else ""))
+
+
+def plot_coverage_curve(curves, save_path, tag=""):
+    """名义覆盖率 vs 经验覆盖率 —— 越贴近对角线越可信。
+
+    curves: {"方法名": [{"nominal","picp"}, ...], ...}
+    """
+    _setup_cn_font()
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7.5, 7))
+    ax.plot([0, 1], [0, 1], color="#95a5a6", linestyle="--", linewidth=1.2,
+            label="完美校准", zorder=1)
+    colors = ["#3498db", "#27ae60", "#e74c3c", "#8e44ad", "#f39c12"]
+    for (name, rows), c in zip(curves.items(), colors):
+        if not rows:
+            continue
+        x = [r["nominal"] for r in rows]
+        y = [r["picp"] for r in rows]
+        ax.plot(x, y, marker="o", ms=6, linewidth=1.8, color=c, label=name)
+    ax.set_xlabel("名义覆盖率", fontsize=12)
+    ax.set_ylabel("经验覆盖率", fontsize=12)
+    ax.set_title(f"区间校准曲线 {tag}", fontsize=13)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=9, loc="lower right")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] 校准曲线已保存: {save_path}")
+
+
+def plot_fan_chart(bt, q_lo, q_hi, q_lo2, q_hi2, save_path, valid_start=None,
+                   title="融合预测区间 (样本外回测)",
+                   outer="80% 区间", inner="60% 区间"):
+    """扇形图: 真值 + 中位数 + 两层区间带。"""
+    _setup_cn_font()
+    import matplotlib.pyplot as plt
+
+    idx = bt.index
+    fig, ax = plt.subplots(figsize=(20, 7))
+    ax.fill_between(idx, q_lo, q_hi, color="#e74c3c", alpha=0.16,
+                    label=outer, linewidth=0)
+    ax.fill_between(idx, q_lo2, q_hi2, color="#e74c3c", alpha=0.22,
+                    label=inner, linewidth=0)
+    ax.plot(idx, bt["y_true"].to_numpy(), color="#2c3e50", linewidth=1.4,
+            label="真实值")
+    ax.plot(idx, bt["pred_ensemble"].to_numpy(), color="#e74c3c", linewidth=1.5,
+            label="融合中位数")
+    if valid_start is not None:
+        ax.axvline(pd.Timestamp(valid_start), color="#8e44ad", linestyle="--",
+                   linewidth=1.6, label="验证窗口起点")
+    ax.set_title(title, fontsize=14)
+    ax.set_xlabel("时间", fontsize=12)
+    ax.set_ylabel("出厂水流量 (m³/h)", fontsize=12)
+    ax.legend(fontsize=10, ncol=2)
+    ax.grid(alpha=0.3)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] 扇形图已保存: {save_path}")
+
+
+# ==================== 概率预测: 校准 + 评估 + 产物 ====================
+
+def run_interval_calibration(args, bt, alpha, method, fit_days, valid_days,
+                             is_fit, is_valid):
+    """区间校准 → 多方案对比 → 落盘产物。返回 summary dict。"""
+    y = bt["y_true"].to_numpy(dtype=np.float64)
+    pt = bt["pred_transformer"].to_numpy(dtype=np.float64)
+    pe = bt["pred_ensemble"].to_numpy(dtype=np.float64)
+    q_f = bt[qf_columns()].to_numpy(dtype=np.float64)
+    hours = bt.index.hour.to_numpy()
+
+    # ── fit / calib 窗口切分 (calib 从 fit 尾部切出, valid 保持完全独立) ──
+    if 0 < args.calib_days < len(fit_days):
+        calib_days = fit_days[-args.calib_days:]
+        alpha_days = fit_days[:-args.calib_days]
+    else:
+        calib_days = fit_days
+        alpha_days = fit_days
+    is_calib = bt["date"].isin({str(d.date()) for d in calib_days}).to_numpy()
+
+    print(f"\n{'=' * 78}\n 概率预测 (区间) 校准与评估\n{'=' * 78}")
+    print(f"  校准窗口: {calib_days[0].date()} ~ {calib_days[-1].date()} "
+          f"({len(calib_days)} 天, {int(is_calib.sum())} 点)")
+    if args.calib_days > 0:
+        print(f"  α 拟合窗口: {alpha_days[0].date()} ~ {alpha_days[-1].date()} "
+              f"({len(alpha_days)} 天)")
+    print(f"  评估窗口: valid {valid_days[0].date()} ~ {valid_days[-1].date()} "
+          f"({int(is_valid.sum())} 点, 完全不参与校准)")
+    print(f"  融合方法: {method}   逐小时最少样本: {args.min_calib_count}")
+
+    # ── 逐小时残差分位数校准 ──
+    hourly, calib_meta = calibrate_residual_quantiles(
+        {"transformer": pt, "ensemble": pe}, y, hours, is_calib,
+        min_count=args.min_calib_count, smooth=not args.no_calib_smooth)
+    n_fb = calib_meta["transformer"]["n_fallback_hours"]
+    counts = calib_meta["transformer"]["n_per_hour"]
+    print(f"  逐小时样本数: min={min(counts)} max={max(counts)} "
+          f"(阈值 {args.min_calib_count})")
+    if n_fb:
+        print(f"  [提示] Transformer 有 {n_fb}/24 个小时样本不足 "
+              f"{args.min_calib_count}, 已回退全局池化分位数; "
+              f"可用更长的校准窗口或调低 --min_calib_count")
+
+    calib = {
+        "schema_version": 1,
+        "levels": list(QUANTILE_LEVELS),
+        "median_index": MEDIAN_INDEX,
+        "day_steps": DAY_STEPS,
+        "context_hours": CONTEXT_HOURS,
+        "alpha": float(alpha),
+        "interval_method": method,
+        "hourly": {k: v.tolist() for k, v in hourly.items()},
+        "pooled": {k: m["pooled"] for k, m in calib_meta.items()},
+        "n_per_hour": calib_meta["transformer"]["n_per_hour"],
+        "n_fallback_hours": n_fb,
+        "n_days": len(calib_days),
+        "decision_hour": args.decision_hour,
+        "calib_window": f"{calib_days[0].date()} ~ {calib_days[-1].date()} "
+                        f"({len(calib_days)} 天)",
+        "smooth_hourly": not args.no_calib_smooth,
+        "transformer_result_dir": os.path.abspath(args.result_dir),
+        "timesfm_model_path": os.path.abspath(args.timesfm_model),
+        "lora_path": os.path.abspath(args.lora_path) if args.lora_path else None,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    # ── 四个候选区间 ──
+    q_T = residual_quantile_table(calib, "transformer", pt, hours)
+    q_A = fuse_quantiles(alpha, q_T, q_f, method)
+    q_B = residual_quantile_table(calib, "ensemble", pe, hours)
+    candidates = [
+        ("TimesFM 原生区间", q_f),
+        ("Transformer 残差校准", q_T),
+        (f"方案A {method}", q_A),
+        ("方案B 直接校准", q_B),
+    ]
+    if method != "mixture":
+        # 线性池也放进来做对照: 它天然不保 "中位数 == 点预测", 这里按推理时的
+        # 做法 (anchor_median) 锚定后再比, 保证比的是实际会用到的区间。
+        q_mix = anchor_median(fuse_quantiles(alpha, q_T, q_f, "mixture"), pe)
+        mix_gap = float(np.max(np.abs(
+            fuse_quantiles(alpha, q_T, q_f, "mixture")[:, MEDIAN_INDEX] - pe)))
+        print(f"  对照: mixture 原始中位数偏离点预测 max = {mix_gap:.1f} m³/h "
+              f"(已锚定; 该偏离量说明两模型分歧很大)")
+        candidates.append(("方案A' mixture", q_mix))
+    for name, qq in candidates:
+        bad = np.argwhere(np.diff(qq, axis=-1) < -1e-9)
+        assert len(bad) == 0, (f"{name} 区间非单调: {len(bad)} 处, "
+                               f"首个在 行{bad[0][0]} 列{bad[0][1]}")
+    gap = float(np.max(np.abs(q_A[:, MEDIAN_INDEX] - pe)))
+    print(f"  不变量校验: |q_A(0.5) - 融合点预测| max = {gap:.2e}  (应恒为 0)")
+
+    # ── 评估 ──
+    rows, summary = [], {}
+    for tag, mask in (("valid", is_valid), ("fit", is_fit), ("全部", is_fit | is_valid)):
+        if mask.sum() == 0:
+            continue
+        for name, qq in candidates:
+            sc = interval_scores(y[mask], qq[mask])
+            summary.setdefault(tag, {})[name] = {
+                "crps": sc["crps"], "pinball": sc["pinball"],
+                "levels": sc["levels"]}
+            for r in sc["levels"]:
+                rows.append({"窗口": tag, "方法": name, "名义覆盖": r["nominal"],
+                             "经验覆盖": r["picp"], "覆盖偏差": r["picp"] - r["nominal"],
+                             "平均宽度": r["mpiw"], "Winkler": r["winkler"],
+                             "CRPS": sc["crps"]})
+    df_interval = pd.DataFrame(rows)
+
+    for tag in ("valid", "fit"):
+        if tag not in summary or not (is_valid if tag == "valid" else is_fit).sum():
+            continue
+        n_pt = int((is_valid if tag == "valid" else is_fit).sum())
+        print(f"\n  ── {tag} 窗口 ({n_pt} 点) ──")
+        print(f"  {'方法':<24}{'名义':>6}{'经验':>8}{'偏差':>8}"
+              f"{'宽度':>9}{'Winkler':>9}{'CRPS':>8}")
+        for name, _ in candidates:
+            blk = summary[tag][name]
+            for i, r in enumerate(blk["levels"]):
+                nm = name if i == 0 else ""
+                crps = f"{blk['crps']:8.1f}" if i == 0 else ""
+                print(f"  {nm:<24}{r['nominal']:>6.2f}{r['picp']:>8.3f}"
+                      f"{r['picp'] - r['nominal']:>+8.3f}{r['mpiw']:>9.1f}"
+                      f"{r['winkler']:>9.1f}{crps}")
+
+    # ── 结论: 主指标是 Winkler (同时惩罚覆盖不足与区间过宽) ──
+    if "valid" in summary:
+        v = summary["valid"]
+        best = min(v.items(), key=lambda kv: kv[1]["crps"])
+        w = min(v.items(), key=lambda kv: kv[1]["levels"][0]["winkler"])
+        print(f"\n  valid 窗口最优 (CRPS): {best[0]}   CRPS={best[1]['crps']:.1f}")
+        print(f"  valid 窗口最优 (80% Winkler): {w[0]}   "
+              f"Winkler={w[1]['levels'][0]['winkler']:.1f}")
+        print(f"  建议: 默认使用 '{method}' 区间融合方法")
+
+    # ── 产物 ──
+    with open(args.calib_out, "w", encoding="utf-8") as f:
+        json.dump(calib, f, ensure_ascii=False, indent=2)
+    print(f"\n[区间] 校准表已保存: {args.calib_out}")
+    df_interval.to_csv(os.path.join(args.out_dir, "interval_metrics.csv"),
+                       index=False, encoding="utf-8-sig", float_format="%.4f")
+
+    if "valid" in summary:
+        plot_coverage_curve(
+            {name: summary["valid"][name]["levels"] for name, _ in candidates},
+            os.path.join(args.out_dir, "interval_coverage.png"),
+            tag=f"(valid 窗口, α={alpha:.3f})")
+
+    plot_fan_chart(
+        bt, q_A[:, 0], q_A[:, -1], q_A[:, 1], q_A[:, -2],
+        os.path.join(args.out_dir, "interval_fan.png"),
+        valid_start=pd.Timestamp(valid_days[0]).normalize(),
+        title=f"融合预测区间 (样本外回测, {method}, α={alpha:.3f})")
+
+    return {
+        "method": method,
+        "calib_path": os.path.abspath(args.calib_out),
+        "calib_window": calib["calib_window"],
+        "n_fallback_hours": n_fb,
+        "median_gap": gap,
+        "valid": summary.get("valid", {}),
+    }
 
 
 # ==================== 主流程 ====================
@@ -369,6 +736,9 @@ def parse_args(argv=None):
     p.add_argument("--valid_days", type=int, default=45, help="独立验证天数 (默认 = test_days/2)")
     p.add_argument("--context_days", type=int, default=BACKTEST_CONTEXT_DAYS,
                    help="每个回测窗口的上下文天数 (默认 25)")
+    p.add_argument("--decision_hour", type=int, default=15,
+                   help="决策时刻可用数据的最后小时 (默认 15 = 16 点决策口径, "
+                        "与生产输入 CSV 一致; 23 = 可用整个前一天, 偏乐观)")
     p.add_argument("--metric", choices=METRIC_CHOICES, default="mae", help="优化目标")
     p.add_argument("--mape_min_actual", type=float, default=0.0,
                    help="MAPE 过滤阈值 (m\u00b3/h, 默认 0)")
@@ -378,6 +748,21 @@ def parse_args(argv=None):
     p.add_argument("--device", default=None, help="推理设备")
     p.add_argument("--no_daily_plots", action="store_true", help="跳过逐日图")
     p.add_argument("--per_day_y", action="store_true", help="逐日图各自缩放 y 轴")
+    # ─ 概率预测 (区间) ──
+    p.add_argument("--calib_out", default=DEFAULT_CALIB_PATH,
+                   help="区间校准表输出路径 (quantile_calibration.json)")
+    p.add_argument("--no_interval", action="store_true",
+                   help="跳过区间校准与评估, 只做点预测权重")
+    p.add_argument("--calib_days", type=int, default=0,
+                   help="从 fit 窗口尾部切出用于区间校准的天数 (默认 0 = 用整个 fit 窗口)")
+    p.add_argument("--interval_method", default="vincentization",
+                   choices=["vincentization", "mixture"],
+                   help="区间融合方法 (默认 vincentization)")
+    p.add_argument("--min_calib_count", type=int, default=40,
+                   help="逐小时校准的最少样本数, 不足则回退全局池化 (默认 40; "
+                        "45 天校准窗口下每小时约 45 个样本)")
+    p.add_argument("--no_calib_smooth", action="store_true",
+                   help="关闭逐小时分位数的循环 3 点平滑")
     return p.parse_args(argv)
 
 
@@ -447,7 +832,8 @@ def main(argv=None):
     # ── 回测 ──
     print(f"\n{'=' * 78}\n 滚动回测 ({len(backtest_days)} 天)\n{'=' * 78}")
     bt, per_day = run_backtest(predictor, raw_df, backtest_days,
-                               context_days=args.context_days)
+                               context_days=args.context_days,
+                               decision_hour=args.decision_hour)
     if bt.empty:
         print("\n[警告] 回测未产生任何数据点")
         return 1
@@ -517,6 +903,17 @@ def main(argv=None):
     bt_csv = os.path.join(args.out_dir, "backtest_predictions.csv")
     bt_out.to_csv(bt_csv, index=True, encoding="utf-8-sig")
 
+    # ── 概率预测 (区间): 校准 + 评估 + 落盘 ──
+    interval_summary = None
+    if args.no_interval:
+        print("\n[区间] --no_interval: 跳过概率预测")
+    elif not all(c in bt_out.columns for c in qf_columns()):
+        print("\n[区间] [警告] 回测缺少 TimesFM 分位数列, 跳过概率预测")
+    else:
+        interval_summary = run_interval_calibration(
+            args, bt_out, alpha, args.interval_method, fit_days, valid_days,
+            is_fit, is_valid)
+
     df_metrics.to_csv(os.path.join(args.out_dir, "ensemble_metrics.csv"),
                       index=False, encoding="utf-8-sig", float_format="%.4f")
     if not per_day.empty:
@@ -534,6 +931,8 @@ def main(argv=None):
         f.write(f"验证窗口    : {valid_days[0].date()} ~ {valid_days[-1].date()} "
                 f"({len(valid_days)} 天)\n")
         f.write(f"优化目标    : {args.metric}\n")
+        f.write(f"决策口径    : 前一天 {args.decision_hour}:00 截止 "
+                f"(日内缺口 {max(0, 23 - args.decision_hour)}h)\n")
         f.write(f"误差相关系数 ρ = {rho_fit:.4f}\n")
         f.write(f"TimesFM 护栏裁剪 = {n_clipped_total}\n\n")
         f.write(f"alpha (fit)   = {alpha:.4f}\n")
@@ -541,6 +940,19 @@ def main(argv=None):
         f.write(f"alpha (MSE)   = {alpha_mse:.4f}\n\n")
         f.write(df_metrics.to_string(index=False, float_format=lambda x: f"{x:.2f}"))
         f.write("\n")
+        if interval_summary:
+            f.write(f"\n── 概率预测 (区间) ──\n")
+            f.write(f"区间融合方法  = {interval_summary['method']}\n")
+            f.write(f"区间校准窗口  = {interval_summary['calib_window']}\n")
+            f.write(f"校准表        = {interval_summary['calib_path']}\n")
+            f.write(f"点预测不变量  |q(0.5)-pred|max = "
+                    f"{interval_summary['median_gap']:.2e}\n")
+            for name, blk in interval_summary["valid"].items():
+                l0 = blk["levels"][0]
+                f.write(f"  [valid] {name:<24} CRPS={blk['crps']:8.2f}  "
+                        f"80%覆盖={l0['picp']:.3f} 宽度={l0['mpiw']:.1f} "
+                        f"Winkler={l0['winkler']:.1f}\n")
+            f.write("\n")
 
     # ── weights.json ──
     weights = {
@@ -550,6 +962,7 @@ def main(argv=None):
         "alpha_timesfm": 1.0 - alpha,
         "fit_metric": args.metric,
         "fit_resolution": "1h",
+        "decision_hour": args.decision_hour,
         "fit_window": f"{fit_days[0].date()} ~ {fit_days[-1].date()} ({len(fit_days)} 天)",
         "valid_window": f"{valid_days[0].date()} ~ {valid_days[-1].date()} "
                         f"({len(valid_days)} 天)",
@@ -564,6 +977,13 @@ def main(argv=None):
         "transformer_result_dir": os.path.abspath(args.result_dir),
         "timesfm_model_path": os.path.abspath(args.timesfm_model),
         "lora_path": os.path.abspath(lora_path) if lora_path else None,
+        "interval": ({
+            "method": interval_summary["method"],
+            "calibration_path": interval_summary["calib_path"],
+            "calibration_window": interval_summary["calib_window"],
+            "median_gap": interval_summary["median_gap"],
+            "valid_metrics": interval_summary["valid"],
+        } if interval_summary else None),
         "n_fit_points": int(is_fit.sum()),
         "n_valid_points": int(is_valid.sum()),
         "mape_min_actual": args.mape_min_actual,
@@ -581,9 +1001,12 @@ def main(argv=None):
 
     if not args.no_daily_plots:
         daily_dir = os.path.join(args.out_dir, "daily")
+        band_calib = None if args.no_interval else \
+            JunshanEnsemblePredictor._load_calibration(args.calib_out)
         plot_daily_figures(bt_out, daily_dir, alpha,
                            valid_start=pd.Timestamp(valid_days[0]).normalize(),
-                           per_day_y=args.per_day_y)
+                           per_day_y=args.per_day_y, calib=band_calib,
+                           interval_method=args.interval_method)
 
     print(f"\n{'=' * 78}")
     print(f" weights.json : {args.weights_out}")

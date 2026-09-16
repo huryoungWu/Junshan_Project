@@ -44,7 +44,8 @@ TRANSFORMER_PKG_DIR = ensure_import_paths(verbose=False)
 from ensemble_predictor import (                                      # noqa: E402
     JunshanEnsemblePredictor, fuse,
     DEFAULT_RESULT_DIR, DEFAULT_TIMESFM_MODEL, DEFAULT_WEIGHTS_PATH,
-    DEFAULT_RAW_DATA, DAY_STEPS,
+    DEFAULT_RAW_DATA, DEFAULT_CALIB_PATH, MEDIAN_INDEX, INTERVAL_METHODS,
+    DAY_STEPS,
 )
 from inference_nextday_16h import prepare_input_csv, DEFAULT_SLICE_DAYS  # type: ignore # noqa: E402
 
@@ -55,15 +56,20 @@ DEFAULT_DATA = os.path.join(PROJECT_ROOT, "data",
 def predict_ensemble(csv_path, result_dir=DEFAULT_RESULT_DIR,
                      timesfm_model_path=DEFAULT_TIMESFM_MODEL,
                      weights_path=DEFAULT_WEIGHTS_PATH, alpha=None,
-                     device=None):
+                     calib_path=DEFAULT_CALIB_PATH, with_interval=True,
+                     interval_method="vincentization", device=None):
     """融合预测 (库调用接口)。
 
-    Returns: dict {date, provider, unit, interval_minutes, horizon, values}
+    Returns: dict {date, provider, unit, interval_minutes, horizon, values
+                   [, quantiles, interval, uncertainty]}
+
+    with_interval=False 时返回值与加入概率预测之前逐字段一致。
     """
     p = JunshanEnsemblePredictor(
         result_dir=result_dir, timesfm_model_path=timesfm_model_path,
-        weights_path=weights_path, alpha=alpha, device=device)
-    return p.predict(csv_path)
+        weights_path=weights_path, alpha=alpha, calib_path=calib_path,
+        interval_method=interval_method, device=device)
+    return p.predict(csv_path, with_interval=with_interval)
 
 
 def main():
@@ -82,6 +88,13 @@ def main():
                         help="融合权重文件 (weights.json)")
     parser.add_argument("--alpha", type=float, default=None,
                         help="显式指定 α (不读 weights.json)")
+    parser.add_argument("--calib", default=DEFAULT_CALIB_PATH,
+                        help="区间校准表 (quantile_calibration.json)")
+    parser.add_argument("--interval_method", default="vincentization",
+                        choices=list(INTERVAL_METHODS),
+                        help="区间融合方法 (默认 vincentization)")
+    parser.add_argument("--no-interval", action="store_true",
+                        help="关闭概率预测, 只输出点预测")
     parser.add_argument("--out", default=None, help="JSON 输出文件路径")
     parser.add_argument("--no-compare", action="store_true",
                         help="跳过预测 vs 实际对比")
@@ -100,8 +113,9 @@ def main():
     # 融合预测
     predictor = JunshanEnsemblePredictor(
         result_dir=args.result_dir, timesfm_model_path=args.timesfm_model,
-        weights_path=args.weights, alpha=args.alpha)
-    result = predictor.predict(csv_path)
+        weights_path=args.weights, alpha=args.alpha, calib_path=args.calib,
+        interval_method=args.interval_method)
+    result = predictor.predict(csv_path, with_interval=not args.no_interval)
 
     text = json.dumps(result, ensure_ascii=False, indent=2)
     print("\n" + "=" * 60)
@@ -168,11 +182,26 @@ def _compare_with_actual(predictor, result, raw_csv, fallback_csv):
     print(f"       MAE = {mae:.2f} m³/h")
     print(f"       MAPE = {mape:.2f}%")
 
+    # 区间命中情况 (概率预测)
+    band = None
+    if "interval" in result and "quantiles" in result:
+        q = np.asarray(result["quantiles"]["values"], dtype=float)[:, :n]
+        lo, hi = q[0], q[-1]
+        cov = float(result["interval"]["coverage"])
+        n_in = int(((y_true >= lo) & (y_true <= hi)).sum())
+        band = (lo, hi, q[MEDIAN_INDEX])
+        print(f"       {cov:.0%} 区间: 命中 {n_in}/{n} "
+              f"(实测覆盖率 {n_in / n:.1%}), 平均宽度 "
+              f"{float(np.mean(hi - lo)):.1f} m³/h")
+
     # 画对比图
     plt.rcParams["font.sans-serif"] = ["SimHei"]
     plt.rcParams["axes.unicode_minus"] = False
     hours = np.arange(n)
     fig, ax = plt.subplots(figsize=(12, 5.5))
+    if band is not None:
+        ax.fill_between(hours, band[0], band[1], color="#e74c3c", alpha=0.15,
+                        label=f"{result['interval']['coverage']:.0%} 区间", linewidth=0)
     ax.plot(hours, y_true, color="#2c3e50", linewidth=1.8, marker="o", ms=4, label="实际流量")
     ax.plot(hours, y_pred_n, color="#e74c3c", linewidth=1.8, linestyle="--",
             marker="s", ms=4, label="融合预测")
