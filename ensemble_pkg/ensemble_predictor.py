@@ -41,7 +41,7 @@ from data_processing import DataProcessor                     # type: ignore  # 
 DEFAULT_RESULT_DIR = os.path.join(
     PROJECT_ROOT, "transformer_pkg", "results",
     "junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_155317")
-DEFAULT_TIMESFM_MODEL = os.path.join(PROJECT_ROOT, "timesfm_model")
+DEFAULT_TIMESFM_MODEL = os.path.join(PROJECT_ROOT, "timesfm_model_transformers")
 DEFAULT_WEIGHTS_PATH = os.path.join(_HERE, "weights.json")
 DEFAULT_RAW_DATA = os.path.join(PROJECT_ROOT, "data", "水厂2025年小时级汇总.csv")
 
@@ -84,10 +84,12 @@ class JunshanEnsemblePredictor:
     def __init__(self, result_dir=DEFAULT_RESULT_DIR,
                  timesfm_model_path=DEFAULT_TIMESFM_MODEL,
                  weights_path=DEFAULT_WEIGHTS_PATH, alpha=None,
+                 lora_path=None,
                  device=None, verbose=True):
         self.result_dir = result_dir
         self.timesfm_model_path = timesfm_model_path
         self.weights_path = weights_path
+        self.lora_path = lora_path
         self.verbose = verbose
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -179,14 +181,32 @@ class JunshanEnsemblePredictor:
     def tfm(self):
         """TimesFM 懒加载 (首次访问才初始化, 避免不必要的显存占用)。"""
         if self._tfm is None:
-            import timesfm
-            print(f"[Ensemble] 加载 TimesFM 模型: {self.timesfm_model_path}")
-            self._tfm = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
-                self.timesfm_model_path)
-            self._tfm.compile(timesfm.ForecastConfig(
-                max_context=16256, max_horizon=128, normalize_inputs=True,
-                use_continuous_quantile_head=True, force_flip_invariance=True,
-                infer_is_positive=True, fix_quantile_crossing=True))
+            from transformers import TimesFm2_5ModelForPrediction
+            print(f"[Ensemble] 加载 TimesFM 模型 (transformers): {self.timesfm_model_path}")
+            self._tfm = TimesFm2_5ModelForPrediction.from_pretrained(
+                self.timesfm_model_path).to(torch.float32).eval()
+
+            # 加载 LoRA 权重 (如果提供)
+            if self.lora_path and os.path.exists(self.lora_path):
+                from finetune_timesfm_lora import apply_lora
+                # 读取 LoRA 配置 (rank, alpha)
+                lora_dir = os.path.dirname(self.lora_path)
+                config_path = os.path.join(lora_dir, "lora_config.json")
+                lora_rank, lora_alpha = 8, 16.0
+                if os.path.exists(config_path):
+                    with open(config_path, "r") as f:
+                        cfg = json.load(f)
+                    lora_rank = cfg.get("lora_rank", lora_rank)
+                    lora_alpha = cfg.get("lora_alpha", lora_alpha)
+                # 先替换注意力层为 LoRALinear, 再加载权重
+                self._tfm, _ = apply_lora(self._tfm, rank=lora_rank, alpha=lora_alpha)
+                lora_state = torch.load(self.lora_path, map_location=self.device,
+                                        weights_only=True)
+                self._tfm.load_state_dict(lora_state, strict=False)
+                print(f"[Ensemble] LoRA 权重已加载: {self.lora_path} "
+                      f"(rank={lora_rank}, alpha={lora_alpha})")
+                self._tfm.eval()
+
             print("[Ensemble] TimesFM 加载完成")
         return self._tfm
 
@@ -318,9 +338,12 @@ class JunshanEnsemblePredictor:
         if len(ctx) < 48:
             raise ValueError(f"TimesFM context 仅 {len(ctx)} 小时, 不足 48")
 
-        point_forecast, _ = self.tfm.forecast(
-            horizon=DAY_STEPS, inputs=[ctx.to_numpy(dtype=np.float64)])
-        return np.asarray(point_forecast[0], dtype=np.float64)[:DAY_STEPS]
+        ctx_tensor = torch.tensor(ctx.to_numpy(dtype=np.float64), dtype=torch.float32)
+        with torch.no_grad():
+            outputs = self.tfm(
+                past_values=[ctx_tensor],
+                forecast_context_len=16256)
+        return outputs.mean_predictions[0, :DAY_STEPS].cpu().numpy().astype(np.float64)
 
     # ── 融合预测 (主接口) ──
 
@@ -380,12 +403,13 @@ if __name__ == "__main__":
     parser.add_argument("--timesfm_model", default=DEFAULT_TIMESFM_MODEL)
     parser.add_argument("--weights", default=DEFAULT_WEIGHTS_PATH)
     parser.add_argument("--alpha", type=float, default=None)
+    parser.add_argument("--lora_path", default=None, help="LoRA 微调权重路径")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
     p = JunshanEnsemblePredictor(
         result_dir=args.result_dir, timesfm_model_path=args.timesfm_model,
-        weights_path=args.weights, alpha=args.alpha)
+        weights_path=args.weights, alpha=args.alpha, lora_path=args.lora_path)
     result = p.predict(args.data)
 
     text = json.dumps(result, ensure_ascii=False, indent=2)

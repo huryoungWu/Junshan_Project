@@ -1,6 +1,7 @@
-融合权重训练结果 (2026-09-15 16:41:35)
+融合权重训练结果 (2026-09-16 14:46:54)
 Transformer : d:\Junshan_Project\transformer_pkg\results\junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_155317
-TimesFM     : d:\Junshan_Project\timesfm_model
+TimesFM     : d:\Junshan_Project\timesfm_model_transformers
+LoRA        : 无
 拟合窗口    : 2025-10-03 ~ 2025-11-16 (45 天)
 验证窗口    : 2025-11-17 ~ 2025-12-31 (45 天)
 优化目标    : mae

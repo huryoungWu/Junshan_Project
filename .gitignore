@@ -1,2 +1,7 @@
+
+data
 models
 timesfm_model
+timesfm_model_transformers
+ensemble_pkg\results
+ensemble_pkg\timesfm_lora

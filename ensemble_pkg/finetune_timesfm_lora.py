@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TimesFM 2.5 LoRA 微调 — 用水厂流量数据微调 TimesFM 的注意力层。
+"""TimesFM 2.5 LoRA 微调 (transformers 版) — 用水厂流量数据微调 TimesFM 的注意力层。
 
 原理:
   TimesFM 2.5 是200M参数的预训练时序基础模型。LoRA (Low-Rank Adaptation) 在每层
@@ -7,7 +7,7 @@
   冻结原始权重, 既保留预训练能力又适配新数据。
 
 LoRA 目标层:
-  每层 Transformer 的 attn.qkv_proj (Q/K/V合并投影) 和 attn.out (输出投影)
+  每层 Transformer 的 self_attn.q_proj, k_proj, v_proj, o_proj
 
 用法:
   python finetune_timesfm_lora.py
@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -44,11 +45,11 @@ ensure_import_paths(verbose=False)
 from data_processing import DataProcessor                          # noqa: E402
 
 # ── 默认路径 ──
-DEFAULT_TIMESFM_MODEL = os.path.join(PROJECT_ROOT, "timesfm_model")
+DEFAULT_TIMESFM_MODEL = os.path.join(PROJECT_ROOT, "timesfm_model_transformers")
 DEFAULT_DATA = os.path.join(PROJECT_ROOT, "data", "水厂2025年小时级汇总.csv")
 DEFAULT_OUT_DIR = os.path.join(_HERE, "timesfm_lora")
 
-CONTEXT_LEN = 168          # 7天 × 24h = 168 小时
+CONTEXT_LEN = 168 * 3          # 7天 × 24h = 168 小时
 HORIZON_LEN = 24           # 预测24小时
 PATCH_LEN = 32             # TimesFM 内部 patch 长度
 
@@ -87,113 +88,25 @@ class LoRALinear(nn.Module):
         return frozen_out + lora_out
 
 
-def patch_decode_no_grad(model):
-    """Monkey-patch: 让 decode() 和 compiled_decode() 中的梯度能回传。
-
-    两步:
-    1. decode() 中的 torch.no_grad → no-op
-    2. compiled_decode() 闭包中 output[0].cpu().numpy() → 保留 tensor
-    """
-    import contextlib, types
-
-    class _NoOpNoGrad:
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def __call__(self, func): return func
-
-    original_decode = model.model.decode
-    _real_no_grad = torch.no_grad
-    original_compiled_decode = model.compiled_decode
-
-    def patched_decode(horizon, inputs, masks):
-        torch.no_grad = _NoOpNoGrad
-        try:
-            return original_decode(horizon, inputs, masks)
-        finally:
-            torch.no_grad = _real_no_grad
-
-    model.model.decode = patched_decode
-
-    # Patch compiled_decode: 保留 tensor 输出 (不转 numpy)
-    import timesfm.torch.util as tfm_util
-
-    def patched_compiled_decode(horizon, inputs, masks):
-        fc = model.forecast_config
-        if horizon > fc.max_horizon:
-            raise ValueError(f"Horizon {horizon} > max {fc.max_horizon}")
-
-        inputs_t = torch.from_numpy(np.array(inputs)).to(model.model.device).float()
-        masks_t = torch.from_numpy(np.array(masks)).to(model.model.device).bool()
-        batch_size = inputs_t.shape[0]
-
-        if fc.infer_is_positive:
-            is_positive = torch.all(inputs_t >= 0, dim=-1, keepdim=True)
-        else:
-            is_positive = None
-
-        if fc.normalize_inputs:
-            mu = torch.mean(inputs_t, dim=-1, keepdim=True)
-            sigma = torch.std(inputs_t, dim=-1, keepdim=True)
-            inputs_t = tfm_util.revin(inputs_t, mu, sigma, reverse=False)
-        else:
-            mu, sigma = None, None
-
-        torch.no_grad = _NoOpNoGrad
-        try:
-            pf_outputs, quantile_spreads, ar_outputs = model.model.decode(
-                fc.max_horizon, inputs_t, masks_t)
-        finally:
-            torch.no_grad = _real_no_grad
-
-        to_cat = [pf_outputs[:, -1, ...]]
-        if ar_outputs is not None:
-            to_cat.append(ar_outputs.reshape(batch_size, -1, model.model.q))
-        full_forecast = torch.cat(to_cat, dim=1)
-
-        # 保留 tensor 输出 (不转 numpy), 后续通过 .cpu().numpy() 再转换
-        def flip_quantile_fn(x):
-            return torch.cat([x[..., :1], torch.flip(x[..., 1:], dims=(-1,))], dim=-1)
-
-        if fc.normalize_inputs and mu is not None:
-            full_forecast = tfm_util.revin(full_forecast, mu, sigma, reverse=True)
-            if is_positive is not None:
-                full_forecast = full_forecast * is_positive.float()
-            if fc.fix_quantile_crossing:
-                full_forecast = torch.cat([
-                    full_forecast[..., :5],
-                    flip_quantile_fn(full_forecast[..., 5:])
-                ], dim=-1)
-
-        return full_forecast[..., :5], full_forecast
-
-    model.compiled_decode = patched_compiled_decode
-
-    def restore():
-        torch.no_grad = _real_no_grad
-        model.model.decode = original_decode
-        model.compiled_decode = original_compiled_decode
-    return restore
-
-
 def apply_lora(model, rank=8, alpha=16.0, target_modules=None):
-    """给 TimesFM 的指定层添加 LoRA。
+    """给 Transformers 版 TimesFM 的注意力层添加 LoRA。
 
     Args:
-        model: TimesFM 模型
+        model: TimesFm2_5ModelForPrediction 模型
         rank: LoRA 秩
         alpha: LoRA 缩放因子
-        target_modules: 要替换的模块名列表, 默认 ["qkv_proj", "out"]
+        target_modules: 要替换的模块名列表, 默认 ["q_proj", "k_proj", "v_proj", "o_proj"]
 
     Returns:
-        (lora_model, n_trainable): 添加 LoRA 后的模型, 可训练参数数
+        (model, n_trainable): 添加 LoRA 后的模型, 可训练参数数
     """
     if target_modules is None:
-        target_modules = ["qkv_proj", "out"]
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
     n_replaced = 0
-    # 遍历所有 Transformer 层
-    for layer_idx, transformer in enumerate(model.model.stacked_xf):
-        attn = transformer.attn
+    # 遍历所有 Transformer 层 (model.model.layers)
+    for layer_idx, layer in enumerate(model.model.layers):
+        attn = layer.self_attn
         for mod_name in target_modules:
             original = getattr(attn, mod_name)
             if isinstance(original, nn.Linear) and not isinstance(original, LoRALinear):
@@ -201,10 +114,9 @@ def apply_lora(model, rank=8, alpha=16.0, target_modules=None):
                 setattr(attn, mod_name, lora)
                 n_replaced += 1
 
-    # 统计可训练参数 (注意: TimesFM wrapper 的参数在 .model 子模块上)
-    net = model.model
-    n_trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    n_total = sum(p.numel() for p in net.parameters())
+    # 统计可训练参数
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
     print(f"[LoRA] 替换 {n_replaced} 个线性层")
     print(f"[LoRA] 可训练参数: {n_trainable:,} / {n_total:,} "
           f"({100*n_trainable/n_total:.2f}%)")
@@ -241,49 +153,47 @@ def load_flow_series(raw_csv, config_override=None):
     return hourly
 
 
-def make_lora_training_samples(hourly, context_len=CONTEXT_LEN,
-                                horizon_len=HORIZON_LEN, stride=1):
-    """滑动窗口生成 LoRA 训练样本。
-
-    每个样本: (context[0:context_len], target[context_len:context_len+horizon_len])
-    输入 TimesFM 时 context 是归一化后的时间序列 (单变量)。
-
-    Args:
-        hourly: 小时级流量 Series
-        context_len: 上下文长度 (默认 168)
-        horizon_len: 预测长度 (默认 24)
-        stride: 滑动步长 (默认1=密集采样, 加快用 >1)
-
-    Returns:
-        contexts: (N, context_len) numpy
-        targets:  (N, horizon_len) numpy
-    """
-    vals = hourly.values.astype(np.float64)
-    n = len(vals)
+def _sliding_window(vals, context_len, horizon_len, stride):
+    """从一维数组生成滑动窗口 (context, target) 对。"""
     contexts, targets = [], []
-
-    for i in range(0, n - context_len - horizon_len + 1, stride):
+    for i in range(0, len(vals) - context_len - horizon_len + 1, stride):
         ctx = vals[i:i + context_len]
         tgt = vals[i + context_len:i + context_len + horizon_len]
         if np.any(np.isnan(ctx)) or np.any(np.isnan(tgt)):
             continue
         contexts.append(ctx)
         targets.append(tgt)
+    if not contexts:
+        return np.empty((0, context_len)), np.empty((0, horizon_len))
+    return np.array(contexts, dtype=np.float64), np.array(targets, dtype=np.float64)
 
-    contexts = np.array(contexts, dtype=np.float64)
-    targets = np.array(targets, dtype=np.float64)
-    print(f"[数据] 训练样本: {len(contexts)} 个 "
+
+def make_lora_training_samples(hourly, context_len=CONTEXT_LEN,
+                                horizon_len=HORIZON_LEN, stride=1,
+                                val_ratio=0.2):
+    """按时间先切分, 再分别生成训练/验证样本 — 杜绝数据泄露。
+
+    划分方式: 时间序列前 80% → 训练样本, 后 20% → 验证样本。
+    训练集的任何样本都不会和验证集共享同一小时的原始数据。
+
+    Returns:
+        (train_ctx, train_tgt, val_ctx, val_tgt)
+    """
+    vals = hourly.values.astype(np.float64)
+    n = len(vals)
+    split = int(n * (1 - val_ratio))
+
+    # 先按时间切开, 再各自生成样本
+    train_vals = vals[:split]
+    val_vals = vals[split - context_len:]  # 留出 context 重叠, 保证 val 第一个样本有完整回看
+
+    train_ctx, train_tgt = _sliding_window(train_vals, context_len, horizon_len, stride)
+    val_ctx, val_tgt = _sliding_window(val_vals, context_len, horizon_len, stride)
+
+    print(f"[数据] 时间序列 {n} 点, 切分点={split} (前 {1-val_ratio:.0%} 训练 / 后 {val_ratio:.0%} 验证)")
+    print(f"[数据] 训练样本: {len(train_ctx)} 个  验证样本: {len(val_ctx)} 个  "
           f"(context={context_len}, horizon={horizon_len}, stride={stride})")
-    return contexts, targets
-
-
-def normalize_per_sample(ctx):
-    """逐样本归一化: (x - mean) / std, 用于 TimesFM 输入。"""
-    mu = ctx.mean()
-    sigma = ctx.std()
-    if sigma < 1e-8:
-        sigma = 1.0
-    return (ctx - mu) / sigma, mu, sigma
+    return train_ctx, train_tgt, val_ctx, val_tgt
 
 
 # ==================== 训练 ====================
@@ -301,7 +211,7 @@ class LoRATimeSeriesDataset(torch.utils.data.Dataset):
         return self.contexts[idx], self.targets[idx]
 
 
-def train_lora(model, contexts, targets, args):
+def train_lora(model, train_ctx, train_tgt, val_ctx, val_tgt, args):
     """LoRA 微调主循环。
 
     训练策略:
@@ -311,17 +221,11 @@ def train_lora(model, contexts, targets, args):
       - 早停: 连续 patience 个 epoch 验证 loss 不降则停止
     """
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model.model = model.model.to(device)
-    model.model.eval()  # 部分层有 dropout, eval 模式更稳定
+    model = model.to(device)
+    model.eval()  # 部分层有 dropout, eval 模式更稳定
 
-    # 数据划分: 80% 训练, 20% 验证
-    n = len(contexts)
-    n_train = int(0.8 * n)
-    idx = np.random.permutation(n)
-    train_idx, val_idx = idx[:n_train], idx[n_train:]
-
-    train_dataset = LoRATimeSeriesDataset(contexts[train_idx], targets[train_idx])
-    val_dataset = LoRATimeSeriesDataset(contexts[val_idx], targets[val_idx])
+    train_dataset = LoRATimeSeriesDataset(train_ctx, train_tgt)
+    val_dataset = LoRATimeSeriesDataset(val_ctx, val_tgt)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
@@ -331,7 +235,7 @@ def train_lora(model, contexts, targets, args):
         pin_memory=True, num_workers=0)
 
     # 只训练 LoRA 参数
-    trainable_params = [p for p in model.model.parameters() if p.requires_grad]
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     print(f"[训练] 可训练参数: {sum(p.numel() for p in trainable_params):,}")
     print(f"[训练] 训练集: {len(train_dataset)} 样本, 验证集: {len(val_dataset)} 样本")
 
@@ -345,82 +249,119 @@ def train_lora(model, contexts, targets, args):
     patience_counter = 0
     history = []
 
+    # 总 batch 数 (用于进度条总量)
+    n_train_batches_total = len(train_loader)
+    n_val_batches_total = len(val_loader)
+
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
+
         # ── 训练 ──
-        model.model.train()
+        model.train()
         train_loss_sum = 0.0
         n_train_batches = 0
 
-        for ctx_batch, tgt_batch in train_loader:
+        train_bar = tqdm(
+            train_loader, desc=f"Epoch {epoch:3d}/{args.epochs} [Train]",
+            total=n_train_batches_total, leave=False, ncols=100,
+            bar_format="{l_bar}{bar:30}{r_bar}")
+        for ctx_batch, tgt_batch in train_bar:
             ctx_batch = ctx_batch.to(device)    # (B, 168)
             tgt_batch = tgt_batch.to(device)    # (B, 24)
 
             optimizer.zero_grad(set_to_none=True)
 
-            # TimesFM forecast: 输入 (B, 168), 输出 (B, 24)
-            # forecast 方法期望 list of arrays, 逐样本处理
-            # 为加速, 用 batch 方式: 对每个样本调用 forecast, 收集输出
+            # TimesFM forward: 逐样本处理, 每个样本用自身 context 做 z-score 归一化
             batch_preds = []
+            batch_tgt_norm = []
             for i in range(len(ctx_batch)):
                 ctx_np = ctx_batch[i].cpu().numpy().astype(np.float64)
-                point_forecast, _ = model.forecast(
-                    horizon=HORIZON_LEN, inputs=[ctx_np])
-                pred = torch.tensor(point_forecast[0], dtype=torch.float32,
-                                    device=device)
+                # z-score: 用 context 的均值/标准差归一化, 让 loss 量级稳定在 ~1
+                mu = ctx_np.mean()
+                sigma = ctx_np.std() + 1e-8
+                ctx_norm = (ctx_np - mu) / sigma
+                ctx_tensor = torch.from_numpy(ctx_norm.astype(np.float32)).to(device)
+                outputs = model(
+                    past_values=[ctx_tensor],
+                    forecast_context_len=16256)
+                pred = outputs.mean_predictions[0, :HORIZON_LEN]  # 取前24步
                 batch_preds.append(pred)
+                # target 用同样的 mu/sigma 归一化
+                tgt_norm = (tgt_batch[i] - mu) / sigma
+                batch_tgt_norm.append(tgt_norm)
 
-            pred_all = torch.stack(batch_preds)  # (B, 24)
+            pred_all = torch.stack(batch_preds)       # (B, 24)  归一化空间
+            tgt_norm_all = torch.stack(batch_tgt_norm) # (B, 24)  归一化空间
 
-            # MSE loss
-            loss = nn.functional.mse_loss(pred_all, tgt_batch)
+            # MSE loss (归一化空间, loss ~1 量级)
+            loss = nn.functional.mse_loss(pred_all, tgt_norm_all)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
 
             train_loss_sum += loss.item()
             n_train_batches += 1
+            train_bar.set_postfix(loss=f"{loss.item():.6f}",
+                                  avg=f"{train_loss_sum / n_train_batches:.6f}")
+        train_bar.close()
 
         train_loss = train_loss_sum / max(n_train_batches, 1)
         scheduler.step()
 
         # ── 验证 ──
-        model.model.eval()
+        model.eval()
         val_loss_sum = 0.0
         n_val_batches = 0
 
+        val_bar = tqdm(
+            val_loader, desc=f"Epoch {epoch:3d}/{args.epochs} [Val]  ",
+            total=n_val_batches_total, leave=False, ncols=100,
+            bar_format="{l_bar}{bar:30}{r_bar}")
         with torch.no_grad():
-            for ctx_batch, tgt_batch in val_loader:
+            for ctx_batch, tgt_batch in val_bar:
                 ctx_batch = ctx_batch.to(device)
                 tgt_batch = tgt_batch.to(device)
 
                 batch_preds = []
+                batch_tgt_norm = []
                 for i in range(len(ctx_batch)):
                     ctx_np = ctx_batch[i].cpu().numpy().astype(np.float64)
-                    point_forecast, _ = model.forecast(
-                        horizon=HORIZON_LEN, inputs=[ctx_np])
-                    pred = torch.tensor(point_forecast[0], dtype=torch.float32,
-                                        device=device)
+                    mu = ctx_np.mean()
+                    sigma = ctx_np.std() + 1e-8
+                    ctx_norm = (ctx_np - mu) / sigma
+                    ctx_tensor = torch.from_numpy(ctx_norm.astype(np.float32)).to(device)
+                    outputs = model(
+                        past_values=[ctx_tensor],
+                        forecast_context_len=16256)
+                    pred = outputs.mean_predictions[0, :HORIZON_LEN]
                     batch_preds.append(pred)
+                    tgt_norm = (tgt_batch[i] - mu) / sigma
+                    batch_tgt_norm.append(tgt_norm)
 
                 pred_all = torch.stack(batch_preds)
-                val_loss = nn.functional.mse_loss(pred_all, tgt_batch)
+                tgt_norm_all = torch.stack(batch_tgt_norm)
+                val_loss = nn.functional.mse_loss(pred_all, tgt_norm_all)
                 val_loss_sum += val_loss.item()
                 n_val_batches += 1
+                val_bar.set_postfix(loss=f"{val_loss.item():.6f}")
+        val_bar.close()
 
         val_loss = val_loss_sum / max(n_val_batches, 1)
         lr_now = optimizer.param_groups[0]["lr"]
+        epoch_time = time.time() - epoch_start
 
         history.append({"epoch": epoch, "train_loss": train_loss,
                         "val_loss": val_loss, "lr": lr_now})
 
+        best_mark = "  ★ best" if val_loss < best_val_loss else ""
         print(f"  Epoch {epoch:3d}/{args.epochs}  "
               f"train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  "
-              f"lr={lr_now:.6f}"
-              f"{'  ← best' if val_loss < best_val_loss else ''}")
+              f"lr={lr_now:.6f}  time={epoch_time:.1f}s"
+              f"{best_mark}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_state = deepcopy(model.model.state_dict())
+            best_state = deepcopy({k: v.cpu() for k, v in model.state_dict().items()})
             patience_counter = 0
         else:
             patience_counter += 1
@@ -439,9 +380,7 @@ def save_lora_weights(model, out_dir, args, history, best_val_loss):
     lora_state = {}
     for name, param in model.named_parameters():
         if param.requires_grad:
-            # 去掉前缀 "model." 以匹配原始模型路径
-            clean_name = name.replace("model.model.", "model.")
-            lora_state[clean_name] = param.data.cpu()
+            lora_state[name] = param.data.cpu()
 
     # 保存
     torch.save(lora_state, os.path.join(out_dir, "lora_weights.pth"))
@@ -449,7 +388,7 @@ def save_lora_weights(model, out_dir, args, history, best_val_loss):
     config = {
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
-        "target_modules": ["qkv_proj", "out"],
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
         "context_len": CONTEXT_LEN,
         "horizon_len": HORIZON_LEN,
         "base_model_path": os.path.abspath(args.timesfm_model),
@@ -493,10 +432,10 @@ def save_lora_weights(model, out_dir, args, history, best_val_loss):
 # ==================== 主入口 ====================
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="TimesFM 2.5 LoRA 微调 (水厂流量)")
+    p = argparse.ArgumentParser(description="TimesFM 2.5 LoRA 微调 (transformers 版)")
     p.add_argument("--data", default=DEFAULT_DATA, help="原始数据 CSV")
     p.add_argument("--timesfm_model", default=DEFAULT_TIMESFM_MODEL,
-                   help="TimesFM 预训练模型目录")
+                   help="TimesFM 预训练模型目录 (transformers 格式)")
     p.add_argument("--out_dir", default=DEFAULT_OUT_DIR, help="输出目录")
     p.add_argument("--lora_rank", type=int, default=8, help="LoRA 秩 (默认 8)")
     p.add_argument("--lora_alpha", type=float, default=16.0,
@@ -505,7 +444,7 @@ def parse_args(argv=None):
     p.add_argument("--epochs", type=int, default=30, help="最大训练轮数")
     p.add_argument("--batch_size", type=int, default=4, help="批大小")
     p.add_argument("--patience", type=int, default=5, help="早停耐心值")
-    p.add_argument("--stride", type=int, default=1, help="滑动窗口步长")
+    p.add_argument("--stride", type=int, default=24, help="滑动窗口步长 (默认 24 = 一天)")
     p.add_argument("--device", default=None, help="推理设备")
     p.add_argument("--seed", type=int, default=42, help="随机种子")
     return p.parse_args(argv)
@@ -523,42 +462,35 @@ def main(argv=None):
         torch.cuda.manual_seed_all(args.seed)
 
     # ── 加载数据 ──
-    print(f"\n{'='*70}\n TimesFM LoRA 微调\n{'='*70}")
+    print(f"\n{'='*70}\n TimesFM LoRA 微调 (transformers 版)\n{'='*70}")
     hourly = load_flow_series(args.data)
-    contexts, targets = make_lora_training_samples(hourly, stride=args.stride)
+    train_ctx, train_tgt, val_ctx, val_tgt = make_lora_training_samples(
+        hourly, stride=args.stride)
 
-    # ── 加载 TimesFM ──
+    # ── 加载 TimesFM (transformers) ──
     print(f"\n[模型] 加载 TimesFM: {args.timesfm_model}")
-    import timesfm
-    model_obj = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
-        args.timesfm_model, torch_compile=False)  # torch_compile 会打断梯度, fine-tuning 时关闭
-    model_obj.compile(timesfm.ForecastConfig(
-        max_context=16256, max_horizon=128, normalize_inputs=True,
-        use_continuous_quantile_head=True, force_flip_invariance=True,
-        infer_is_positive=True, fix_quantile_crossing=True))
-    print("[模型] TimesFM 加载完成 (torch_compile=OFF)")
+    from transformers import TimesFm2_5ModelForPrediction
+    model = TimesFm2_5ModelForPrediction.from_pretrained(args.timesfm_model)
+    model = model.to(torch.float32)
+    print("[模型] TimesFM 加载完成 (transformers)")
 
     # ── 应用 LoRA ──
     print(f"\n[LoRA] rank={args.lora_rank}, alpha={args.lora_alpha}")
-    model_obj, n_trainable = apply_lora(
-        model_obj, rank=args.lora_rank, alpha=args.lora_alpha)
+    model, n_trainable = apply_lora(
+        model, rank=args.lora_rank, alpha=args.lora_alpha)
 
     # ── 训练 ──
-    # decode() 内部有 torch.no_grad(), 会阻止梯度回传到 LoRA 层
-    # 训练期间重写 decode 移除 no_grad, 训练后恢复
-    restore_no_grad = patch_decode_no_grad(model_obj)
-    print(f"\n[训练] 开始 LoRA 微调 (decode torch.no_grad 已移除)...")
+    print(f"\n[训练] 开始 LoRA 微调...")
     t0 = time.time()
     best_state, history, best_val_loss = train_lora(
-        model_obj, contexts, targets, args)
+        model, train_ctx, train_tgt, val_ctx, val_tgt, args)
     t1 = time.time()
-    restore_no_grad()  # 恢复 torch.no_grad
     print(f"\n[训练] 完成, 耗时 {t1-t0:.1f}s, 最佳验证 loss = {best_val_loss:.6f}")
 
     # ── 保存 ──
     if best_state is not None:
-        model_obj.model.load_state_dict(best_state)
-    save_lora_weights(model_obj, args.out_dir, args, history, best_val_loss)
+        model.load_state_dict(best_state)
+    save_lora_weights(model, args.out_dir, args, history, best_val_loss)
 
     print(f"\n{'='*70}")
     print(f" LoRA 微调完成!")

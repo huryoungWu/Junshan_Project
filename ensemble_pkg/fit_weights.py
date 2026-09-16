@@ -190,9 +190,12 @@ def run_backtest(predictor, raw_df, test_days,
             ctx = hourly_full[hourly_full.index < cutoff_ts].iloc[-CONTEXT_HOURS:]
             if len(ctx) < 48:
                 raise ValueError(f"context 仅 {len(ctx)} 小时")
-            point_forecast, _ = predictor.tfm.forecast(
-                horizon=DAY_STEPS, inputs=[ctx.to_numpy(dtype=np.float64)])
-            pred_f = np.asarray(point_forecast[0], dtype=np.float64)[:DAY_STEPS]
+            ctx_tensor = torch.tensor(ctx.to_numpy(dtype=np.float64), dtype=torch.float32)
+            with torch.no_grad():
+                outputs = predictor.tfm(
+                    past_values=[ctx_tensor],
+                    forecast_context_len=16256)
+            pred_f = outputs.mean_predictions[0, :DAY_STEPS].cpu().numpy().astype(np.float64)
         except Exception as e:
             print(f"  [失败] TimesFM: {e}")
             continue
@@ -370,6 +373,8 @@ def parse_args(argv=None):
     p.add_argument("--mape_min_actual", type=float, default=0.0,
                    help="MAPE 过滤阈值 (m\u00b3/h, 默认 0)")
     p.add_argument("--alpha_grid", type=float, default=0.005, help="α 网格步长")
+    p.add_argument("--lora_path", default=None, help="TimesFM LoRA 微调权重路径 (lora_weights.pth)")
+    p.add_argument("--no_lora", action="store_true", help="不使用 LoRA 微调权重 (使用原始 TimesFM)")
     p.add_argument("--device", default=None, help="推理设备")
     p.add_argument("--no_daily_plots", action="store_true", help="跳过逐日图")
     p.add_argument("--per_day_y", action="store_true", help="逐日图各自缩放 y 轴")
@@ -383,9 +388,20 @@ def main(argv=None):
     # ── 加载模型 ──
     # 训练权重时 weights.json 尚不存在, 用 alpha=0.5 占位 (不影响回测)
     print(f"[fit_weights] 加载模型...")
+    if args.no_lora:
+        lora_path = None
+        print("[fit_weights] --no_lora: 不使用 LoRA, 使用原始 TimesFM")
+    else:
+        lora_path = args.lora_path or os.path.join(_HERE, "timesfm_lora", "lora_weights.pth")
+        if not os.path.exists(lora_path):
+            lora_path = None
+            print("[fit_weights] 未找到 LoRA 权重, 使用原始 TimesFM")
+        else:
+            print(f"[fit_weights] 使用 LoRA 微调 TimesFM: {lora_path}")
     predictor = JunshanEnsemblePredictor(
         result_dir=args.result_dir, timesfm_model_path=args.timesfm_model,
-        weights_path=args.weights_out, alpha=0.5, device=args.device, verbose=False)
+        weights_path=args.weights_out, alpha=0.5, lora_path=lora_path,
+        device=args.device, verbose=False)
 
     # ── 加载数据 ──
     raw_df = pd.read_csv(args.data, encoding="utf-8-sig")
@@ -512,6 +528,7 @@ def main(argv=None):
         f.write(f"融合权重训练结果 ({datetime.now():%Y-%m-%d %H:%M:%S})\n")
         f.write(f"Transformer : {os.path.abspath(args.result_dir)}\n")
         f.write(f"TimesFM     : {os.path.abspath(args.timesfm_model)}\n")
+        f.write(f"LoRA        : {os.path.abspath(lora_path) if lora_path else '无'}\n")
         f.write(f"拟合窗口    : {fit_days[0].date()} ~ {fit_days[-1].date()} "
                 f"({len(fit_days)} 天)\n")
         f.write(f"验证窗口    : {valid_days[0].date()} ~ {valid_days[-1].date()} "
@@ -546,6 +563,7 @@ def main(argv=None):
         },
         "transformer_result_dir": os.path.abspath(args.result_dir),
         "timesfm_model_path": os.path.abspath(args.timesfm_model),
+        "lora_path": os.path.abspath(lora_path) if lora_path else None,
         "n_fit_points": int(is_fit.sum()),
         "n_valid_points": int(is_valid.sum()),
         "mape_min_actual": args.mape_min_actual,
