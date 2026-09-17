@@ -17,6 +17,7 @@ if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import torch
+torch._dynamo.config.suppress_errors = True
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts

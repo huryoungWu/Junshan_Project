@@ -1,0 +1,6 @@
+[自回归单步, 每天16点预测次日全天] use_multicutoff=False, lookback=7d+12h, detach_feedback=True, predict_steps_max=48
+清洗: spike_abs_floor=100.0, smooth_median_window=3
+指标=目标天 D+1 全天 24h (缺口步参与训练损失, 不计入指标):
+Train: Loss=0.076802, MAE=192.21, RMSE=267.82, MAPE=6.15% (n=866)
+Test: Loss=0.059476, MAE=173.89, RMSE=233.96, MAPE=5.81% (n=82)
+MAPE 过滤: 排除 |true| < 10% * max|true| 的点 (Train 保留 20780/20784 点, Test 保留 1968/1968 点)

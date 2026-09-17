@@ -1,24 +1,24 @@
-融合权重训练结果 (2026-09-16 14:46:54)
-Transformer : d:\Junshan_Project\transformer_pkg\results\junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_155317
+融合权重训练结果 (2026-09-17 18:31:36)
+Transformer : d:\Junshan_Project\transformer_pkg\results\junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260917_181339
 TimesFM     : d:\Junshan_Project\timesfm_model_transformers
 LoRA        : 无
 拟合窗口    : 2025-10-03 ~ 2025-11-16 (45 天)
 验证窗口    : 2025-11-17 ~ 2025-12-31 (45 天)
 优化目标    : mae
-误差相关系数 ρ = 0.8020
+误差相关系数 ρ = 0.7952
 TimesFM 护栏裁剪 = 0
 
-alpha (fit)   = 0.3200
-alpha (valid) = 0.3850
-alpha (MSE)   = 0.3413
+alpha (fit)   = 0.4350
+alpha (valid) = 0.3750
+alpha (MSE)   = 0.4343
 
          窗口                模型  有效点    MAE   RMSE  MAPE(%)
-  fit (45天) Transformer (α=1) 1080 195.62 263.43     6.30
+  fit (45天) Transformer (α=1) 1080 187.23 253.37     6.00
   fit (45天)     TimesFM (α=0) 1080 177.96 246.32     5.65
-  fit (45天)      融合 (α=0.320) 1080 173.69 239.76     5.53
-valid (45天) Transformer (α=1) 1080 167.51 225.17     5.84
+  fit (45天)      融合 (α=0.435) 1080 169.80 235.83     5.40
+valid (45天) Transformer (α=1) 1080 167.45 224.39     5.81
 valid (45天)     TimesFM (α=0) 1080 159.81 219.38     5.60
-valid (45天)      融合 (α=0.320) 1080 153.97 212.29     5.36
-         全部 Transformer (α=1) 2160 181.57 245.05     6.07
+valid (45天)      融合 (α=0.435) 1080 153.33 211.29     5.32
+         全部 Transformer (α=1) 2160 177.34 239.32     5.91
          全部     TimesFM (α=0) 2160 168.88 233.24     5.63
-         全部      融合 (α=0.320) 2160 163.83 226.44     5.44
+         全部      融合 (α=0.435) 2160 161.56 223.90     5.36
