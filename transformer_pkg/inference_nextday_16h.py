@@ -178,7 +178,11 @@ class NextDayPredictor:
         model_path = os.path.join(result_dir, "best_seq2seq_model.pth")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"未找到模型权重: {model_path}")
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        state_dict = torch.load(model_path, map_location=self.device)
+        # 兼容 torch.compile 训练产出的权重 (键名带 TorchDynamo 的 "_orig_mod." 前缀)
+        if any(k.startswith("_orig_mod.") for k in state_dict):
+            state_dict = {k[len("_orig_mod."):]: v for k, v in state_dict.items()}
+        self.model.load_state_dict(state_dict)
         self.model.eval()
 
         # ── 复用训练的 DataProcessor (清洗/特征口径一致, 含 spike_abs_floor 等开关) ──

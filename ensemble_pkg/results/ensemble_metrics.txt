@@ -1,37 +1,37 @@
-融合权重训练结果 (2026-09-16 17:19:49)
-Transformer : D:\Junshan_Project\transformer_pkg\results\junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_155317
-TimesFM     : D:\Junshan_Project\timesfm_model_transformers
+融合权重训练结果 (2026-09-17 18:06:38)
+Transformer : d:\Junshan_Project\transformer_pkg\results\junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260917_174634
+TimesFM     : d:\Junshan_Project\timesfm_model_transformers
 LoRA        : 无
 拟合窗口    : 2025-10-03 ~ 2025-11-16 (45 天)
 验证窗口    : 2025-11-17 ~ 2025-12-31 (45 天)
 优化目标    : mae
 决策口径    : 前一天 15:00 截止 (日内缺口 8h)
-误差相关系数 ρ = 0.8291
+误差相关系数 ρ = 0.8351
 TimesFM 护栏裁剪 = 0
 
-alpha (fit)   = 0.3600
-alpha (valid) = 0.4500
-alpha (MSE)   = 0.4278
+alpha (fit)   = 0.6000
+alpha (valid) = 0.4350
+alpha (MSE)   = 0.6030
 
          窗口                模型  有效点    MAE   RMSE  MAPE(%)
-  fit (45天) Transformer (α=1) 1080 203.84 274.04     6.52
+  fit (45天) Transformer (α=1) 1080 184.57 257.67     5.83
   fit (45天)     TimesFM (α=0) 1080 192.96 266.54     6.06
-  fit (45天)      融合 (α=0.360) 1080 186.49 256.97     5.89
-valid (45天) Transformer (α=1) 1080 167.10 224.59     5.82
+  fit (45天)      融合 (α=0.600) 1080 178.25 250.68     5.61
+valid (45天) Transformer (α=1) 1080 168.27 227.60     5.80
 valid (45天)     TimesFM (α=0) 1080 164.53 224.34     5.78
-valid (45天)      融合 (α=0.360) 1080 156.57 214.73     5.46
-         全部 Transformer (α=1) 2160 185.47 250.54     6.17
+valid (45天)      融合 (α=0.600) 1080 157.10 215.62     5.44
+         全部 Transformer (α=1) 2160 176.42 243.10     5.81
          全部     TimesFM (α=0) 2160 178.75 246.34     5.92
-         全部      融合 (α=0.360) 2160 171.53 236.80     5.68
+         全部      融合 (α=0.600) 2160 167.67 233.81     5.53
 
 ── 概率预测 (区间) ──
 区间融合方法  = vincentization
 区间校准窗口  = 2025-10-03 ~ 2025-11-16 (45 天)
-校准表        = D:\Junshan_Project\ensemble_pkg\results\quantile_calibration.json
+校准表        = d:\Junshan_Project\ensemble_pkg\results\quantile_calibration.json
 点预测不变量  |q(0.5)-pred|max = 0.00e+00
-  [valid] TimesFM 原生区间             CRPS=  132.34  80%覆盖=0.773 宽度=519.8 Winkler=593.7
-  [valid] Transformer 残差校准         CRPS=  135.86  80%覆盖=0.802 宽度=585.6 Winkler=660.8
-  [valid] 方案A vincentization       CRPS=  126.35  80%覆盖=0.813 宽度=543.5 Winkler=607.3
-  [valid] 方案B 直接校准                 CRPS=  128.13  80%覆盖=0.823 宽度=590.9 Winkler=656.0
-  [valid] 方案A' mixture             CRPS=  126.57  80%覆盖=0.814 宽度=544.9 Winkler=607.6
+  [valid] TimesFM 原生区间             CRPS=  132.34  80%覆盖=0.773 宽度=519.8 Winkler=815.3
+  [valid] Transformer 残差校准         CRPS=  138.43  80%覆盖=0.766 宽度=543.1 Winkler=910.7
+  [valid] 方案A vincentization       CRPS=  127.47  80%覆盖=0.803 宽度=533.8 Winkler=819.4
+  [valid] 方案B 直接校准                 CRPS=  129.41  80%覆盖=0.795 宽度=551.2 Winkler=854.0
+  [valid] 方案A' mixture             CRPS=  127.77  80%覆盖=0.809 宽度=540.8 Winkler=822.3
 

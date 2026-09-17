@@ -954,9 +954,10 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
 
         if do_eval and current_mape < best_test_mape:
             best_test_mape = current_mape
-            # torch.compile 后需要 .module 获取原始 state_dict
-            state_to_save = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-            best_state = deepcopy(state_to_save)
+            # torch.compile 返回 OptimizedModule, 原始模块挂在 ._orig_mod 上 (不是 .module),
+            # 直接 model.state_dict() 会带上 "_orig_mod." 前缀, 加载方必须能剥掉。
+            raw_model = getattr(model, "_orig_mod", model)
+            best_state = deepcopy(raw_model.state_dict())
             torch.save(best_state, os.path.join(result_dir, "best_seq2seq_model.pth"))
 
         scheduler.step()

@@ -105,7 +105,11 @@ def predict(csv_path, result_dir=DEFAULT_RESULT_DIR, provider=None, device=None)
         model = iTransformer(**model_kwargs, target_idx=target_feat_idx).to(device)
     else:
         model = TimeSeriesTransformer(**model_kwargs).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    state_dict = torch.load(model_path, map_location=device)
+    # 兼容 torch.compile 训练产出的权重 (键名带 TorchDynamo 的 "_orig_mod." 前缀)
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k[len("_orig_mod."):]: v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.eval()
 
     # 初始化处理器

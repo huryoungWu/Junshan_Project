@@ -17,6 +17,7 @@ if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import torch
+torch._dynamo.config.suppress_errors = True
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
@@ -91,7 +92,7 @@ BASE_CONFIG = {
     "spike_ratio_cross": 1.3,    # 跨日 t±24h 突变阈值 (日间差异大, 需更高阈值)
 
     "lookback_days": 7,          # 前 7 天全天
-    "lookback_extra_hours": 12,  # + 当天 0:00~15:00 共 16 个小时 (16 点前)
+    "lookback_extra_hours": 16,  # + 当天 0:00~15:00 共 16 个小时 (16 点前)
                                  # 总回看 = 7*24 + 16 = 184 小时
     "predict_days": 1.0,         # 第二天全天 24 小时
     "label": f"junshan_L1D_P24H_1h_transformer_nextday16h_mc_{time.strftime('%Y%m%d_%H%M%S')}",
@@ -937,9 +938,10 @@ def run_experiment(cfg, x_train_all, y_train_all, x_test_all, y_test_all, proces
 
         if do_eval and current_mape < best_test_mape:
             best_test_mape = current_mape
-            # torch.compile 后需要 .module 获取原始 state_dict
-            state_to_save = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-            best_state = deepcopy(state_to_save)
+            # torch.compile 返回 OptimizedModule, 原始模块挂在 ._orig_mod 上 (不是 .module),
+            # 直接 model.state_dict() 会带上 "_orig_mod." 前缀, 加载方必须能剥掉。
+            raw_model = getattr(model, "_orig_mod", model)
+            best_state = deepcopy(raw_model.state_dict())
             torch.save(best_state, os.path.join(result_dir, "best_seq2seq_model.pth"))
 
         scheduler.step()

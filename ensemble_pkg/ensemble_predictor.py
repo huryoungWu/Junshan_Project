@@ -40,7 +40,7 @@ from data_processing import DataProcessor                     # type: ignore  # 
 # ── 默认路径 ──
 DEFAULT_RESULT_DIR = os.path.join(
     PROJECT_ROOT, "transformer_pkg", "results",
-    "junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260901_155317")
+    "junshan_L1D_P24H_1h_transformer_nextday16h_mc_20260917_174634")
 DEFAULT_TIMESFM_MODEL = os.path.join(PROJECT_ROOT, "timesfm_model_transformers")
 DEFAULT_WEIGHTS_PATH = os.path.join(_HERE, "weights.json")
 DEFAULT_RAW_DATA = os.path.join(PROJECT_ROOT, "data", "水厂2025年小时级汇总.csv")
@@ -274,7 +274,16 @@ class JunshanEnsemblePredictor:
             self.model = iTransformer(**model_kwargs, target_idx=self.target_feat_idx)
         else:
             self.model = TimeSeriesTransformer(**model_kwargs)
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        state_dict = torch.load(model_path, map_location=self.device)
+        # 训练若启用了 torch.compile, 权重会带上 TorchDynamo 的 "_orig_mod." 前缀,
+        # 而这里加载的是未编译的模型, 需要把前缀剥掉。
+        # 兼容两种编译包装方式: "_orig_mod.<key>" (直接 compile) 和
+        # "model._orig_mod.<key>" (compile 了 nn.Module 子模块)。
+        if any(k.startswith("_orig_mod.") for k in state_dict):
+            state_dict = {k[len("_orig_mod."):]: v for k, v in state_dict.items()}
+        elif any("._orig_mod." in k for k in state_dict):
+            state_dict = {k.replace("._orig_mod.", "."): v for k, v in state_dict.items()}
+        self.model.load_state_dict(state_dict)
         self.model.eval()
         self.model.to(self.device)
 
